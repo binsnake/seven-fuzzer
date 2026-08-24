@@ -67,3 +67,9 @@ vcpkg_installed/
 # test output & cache
 Testing/
 .cache/
+
+# fuzzer run output (regenerated every run, not project source)
+/findings/
+/unicorn_outliers/
+/corpus/
+crash.dmp
