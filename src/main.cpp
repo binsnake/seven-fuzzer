@@ -541,24 +541,39 @@ int run_seed_sweep(std::uint64_t base_seed, std::uint64_t iterations_per_seed, u
     CloseHandle(pi.hThread);
 
     // Move this child's output aside before the next child starts and resets the counters findings/
-    // unicorn_outliers are numbered from.
+    // unicorn_outliers are numbered from. child_seed (and therefore the destination path below) is
+    // deterministic from base_seed + index, so re-running the same base seed reaches this exact same
+    // destination -- std::filesystem::rename throws on Windows if the destination already exists, and
+    // this whole function had no try/catch around it, so a second sweep over an already-swept base
+    // seed reliably crashed the supervisor right here. Pre-clearing the destination and using the
+    // error_code overloads makes a repeat sweep just overwrite stale results instead.
     const std::wstring seed_tag = seed_hex;
     for (const auto& [src_name, dst_prefix] :
         {std::pair<const wchar_t*, const wchar_t*>{L"findings", L"findings_"},
          std::pair<const wchar_t*, const wchar_t*>{L"unicorn_outliers", L"outliers_"}}) {
       const fs::path src = exe_dir_path / src_name;
-      if (fs::exists(src) && !fs::is_empty(src)) {
-        fs::rename(src, sweep_dir / (dst_prefix + seed_tag));
-      } else {
-        std::error_code ec;
-        fs::remove_all(src, ec);
+      std::error_code ec;
+      if (fs::exists(src, ec) && !fs::is_empty(src, ec)) {
+        const fs::path dst = sweep_dir / (dst_prefix + seed_tag);
+        fs::remove_all(dst, ec);
+        fs::rename(src, dst, ec);
+        if (ec) {
+          std::fwprintf(stderr, L"[sweep] warning: failed to archive %ls: %hs\n", src.c_str(), ec.message().c_str());
+        }
       }
+      fs::remove_all(src, ec);
     }
     for (const wchar_t* dmp_name : {L"crash.dmp", L"watchdog_hang.dmp"}) {
       const fs::path src = exe_dir_path / dmp_name;
-      if (fs::exists(src)) {
+      std::error_code ec;
+      if (fs::exists(src, ec)) {
         const std::wstring stem = fs::path(dmp_name).stem().wstring();
-        fs::rename(src, sweep_dir / (stem + L"_" + seed_tag + L".dmp"));
+        const fs::path dst = sweep_dir / (stem + L"_" + seed_tag + L".dmp");
+        fs::remove_all(dst, ec);
+        fs::rename(src, dst, ec);
+        if (ec) {
+          std::fwprintf(stderr, L"[sweep] warning: failed to archive %ls: %hs\n", src.c_str(), ec.message().c_str());
+        }
       }
     }
 
