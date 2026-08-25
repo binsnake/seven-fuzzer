@@ -217,7 +217,20 @@ void run_worker(int worker_id, std::uint64_t iterations, std::uint64_t seed, boo
     }
   }
 
+  // JitExecutor never releases an individual compiled function's executable memory (see
+  // RuntimeKeepalive in seven-jit's block_compiler.cpp for why that path is disabled), and this
+  // lane forces a fresh recompile on literally every TestCase -- left unchecked, that's an
+  // unbounded leak over a long run. Periodically dropping the whole cache and JitRuntime at once
+  // (JitExecutor::recycle(), safe to call here since nothing is executing between TestCases) frees
+  // everything compiled so far in one shot without needing per-function release() at all. every
+  // TestCase re-maps memory with a fresh epoch anyway, so there is no cross-call cache warmth this
+  // lane could lose by recycling -- the only cost is occasionally reconstructing the JitRuntime.
+  constexpr std::uint64_t kJitRecycleInterval = 2000;
+
   for (std::uint64_t local_i = 0; local_i < iterations; ++local_i) {
+    if (use_jit && local_i != 0 && local_i % kJitRecycleInterval == 0) {
+      jit_executor.recycle();
+    }
     const TestCase tc = gen.next();
     if (local_i >= verbose_from) {
       std::lock_guard<std::mutex> lock(counters.io_mutex);
