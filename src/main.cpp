@@ -14,8 +14,19 @@
 // trips per instruction are the actual bottleneck; this is what makes
 // parallelizing it worthwhile.
 //
-// Usage: seven_fuzzer.exe [iterations] [seed] [--no-hw] [--threads N] [--verbose-from N]
+// Usage: seven_fuzzer.exe [iterations] [seed] [--no-hw] [--jit] [--threads N] [--verbose-from N]
+//
+// --jit runs the "seven" side through seven-jit's JitExecutor instead of seven_core's plain
+// interpreter (see lanes/seven_jit_lane.hpp) -- everything else about the run (TestCase generation,
+// the Unicorn/hardware oracles, the comparator, reporting) is unchanged. This is a single check on
+// which engine is under test, not a fourth parallel lane: run once with --jit, once without, to
+// verify both independently against the exact same two oracles.
 
+// NOMINMAX: seven_jit/jit_executor.hpp transitively pulls in seven_core's float80.hpp, which
+// defines std::numeric_limits<Float80>::min()/max() -- windows.h's own min/max macros silently
+// mangle those into broken syntax if left defined, so this has to come before windows.h itself, not
+// just before the seven_jit include below.
+#define NOMINMAX
 #include <windows.h>
 
 #include <dbghelp.h>
@@ -32,9 +43,11 @@
 #include "common/types.hpp"
 #include "gen/instruction_gen.hpp"
 #include "lanes/hardware_lane.hpp"
+#include "lanes/seven_jit_lane.hpp"
 #include "lanes/seven_lane.hpp"
 #include "lanes/unicorn_lane.hpp"
 #include "report/report.hpp"
+#include "seven_jit/jit_executor.hpp"
 
 #pragma comment(lib, "dbghelp.lib")
 
@@ -173,12 +186,21 @@ struct SharedCounters {
   std::mutex compute_mutex;
 };
 
-void run_worker(int worker_id, std::uint64_t iterations, std::uint64_t seed, bool use_hw,
+void run_worker(int worker_id, std::uint64_t iterations, std::uint64_t seed, bool use_hw, bool use_jit,
                  std::uint64_t total_iterations, std::uint64_t verbose_from, const std::string& findings_dir,
                  const std::string& outliers_dir, SharedCounters& counters) {
   _set_se_translator(seh_translator);
   InstructionGenerator gen(mix_seed(seed, worker_id));
   HardwareSession hw;
+  // Reused together across every TestCase this worker runs -- see seven_jit_lane.hpp's comment on
+  // why a fresh JitExecutor per call would be far too expensive, AND why memory has to be reused in
+  // lockstep with it rather than freshly constructed per call (the cache staleness check is
+  // Memory-instance-relative).
+  seven_jit::JitExecutor jit_executor;
+  seven::Memory jit_memory;
+  const char* seven_label = use_jit ? "seven-jit" : "seven";
+  const std::string seven_vs_unicorn_label = std::string(seven_label) + "-vs-unicorn";
+  const std::string seven_vs_hw_label = std::string(seven_label) + "-vs-hw";
   bool worker_use_hw = use_hw;
   if (worker_use_hw) {
     const std::wstring victim_path = exe_dir_w() + L"\\seven_fuzz_victim.exe";
@@ -208,8 +230,15 @@ void run_worker(int worker_id, std::uint64_t iterations, std::uint64_t seed, boo
     LaneOutcome seven_out, unicorn_out;
     {
       std::lock_guard<std::mutex> compute_lock(counters.compute_mutex);
-      seven_out = g_no_seven ? LaneOutcome{} : run_seven(tc);
+      // Unicorn goes first when --jit is active: uc_open()'s first uc_mem_map() lazily triggers
+      // Unicorn's own one-time-per-engine TCG prologue codegen, which needs to claim its own
+      // reachable executable-memory region. Letting asmjit's JitRuntime (run_seven_jit, below)
+      // allocate first reliably corrupts that codegen on this machine -- see seven_jit_lane.hpp's
+      // sibling comment and the memory notes on this investigation. Unicorn is opened/closed fresh
+      // every single call (unlike jit_executor, which is reused across the whole worker), so this
+      // ordering has to hold on every iteration, not just the first.
       unicorn_out = g_no_unicorn ? LaneOutcome{} : run_unicorn(tc);
+      seven_out = g_no_seven ? LaneOutcome{} : (use_jit ? run_seven_jit(tc, jit_executor, jit_memory) : run_seven(tc));
     }
     LaneOutcome hw_out;
     bool hw_ok_this_round = false;
@@ -225,9 +254,9 @@ void run_worker(int worker_id, std::uint64_t iterations, std::uint64_t seed, boo
     }
 
     std::vector<Divergence> seven_vs_unicorn, seven_vs_hw, unicorn_vs_hw;
-    diff_pair("seven-vs-unicorn", seven_out, unicorn_out, tc.flags_mask, seven_vs_unicorn);
+    diff_pair(seven_vs_unicorn_label.c_str(), seven_out, unicorn_out, tc.flags_mask, seven_vs_unicorn);
     if (hw_ok_this_round) {
-      diff_pair("seven-vs-hw", seven_out, hw_out, tc.flags_mask, seven_vs_hw);
+      diff_pair(seven_vs_hw_label.c_str(), seven_out, hw_out, tc.flags_mask, seven_vs_hw);
       diff_pair("unicorn-vs-hw", unicorn_out, hw_out, tc.flags_mask, unicorn_vs_hw);
     }
 
@@ -247,7 +276,8 @@ void run_worker(int worker_id, std::uint64_t iterations, std::uint64_t seed, boo
       outlier_divergences.insert(outlier_divergences.end(), unicorn_vs_hw.begin(), unicorn_vs_hw.end());
       const int oidx = counters.unicorn_outlier_saved.fetch_add(1, std::memory_order_relaxed);
       std::lock_guard<std::mutex> lock(counters.io_mutex);
-      (void)write_finding(outliers_dir, oidx, tc, seven_out, unicorn_out, hw_out, hw_ok_this_round, outlier_divergences);
+      (void)write_finding(outliers_dir, oidx, tc, seven_label, seven_out, unicorn_out, hw_out, hw_ok_this_round,
+                           outlier_divergences);
     } else {
       std::vector<Divergence> divergences = seven_vs_unicorn;
       divergences.insert(divergences.end(), seven_vs_hw.begin(), seven_vs_hw.end());
@@ -260,8 +290,8 @@ void run_worker(int worker_id, std::uint64_t iterations, std::uint64_t seed, boo
         // isn't guaranteed by the standard even if a given implementation
         // usually gets away with it.
         std::lock_guard<std::mutex> lock(counters.io_mutex);
-        const std::string path =
-            write_finding(findings_dir, idx, tc, seven_out, unicorn_out, hw_out, hw_ok_this_round, divergences);
+        const std::string path = write_finding(findings_dir, idx, tc, seven_label, seven_out, unicorn_out, hw_out,
+                                                hw_ok_this_round, divergences);
         std::printf("[worker %d] DIVERGENCE (%s) -> %s\n", worker_id, tc.text.c_str(), path.c_str());
         std::fflush(stdout);
       }
@@ -310,6 +340,7 @@ int main(int argc, char** argv) {
   std::uint64_t iterations = 200000;
   std::uint64_t seed = 0xC0FFEEULL;
   bool use_hw = true;
+  bool use_jit = false;
   std::uint64_t verbose_from = UINT64_MAX;
   unsigned int threads = 0;  // 0 = auto
 
@@ -317,6 +348,12 @@ int main(int argc, char** argv) {
     const std::string a = argv[i];
     if (a == "--no-hw") {
       use_hw = false;
+    } else if (a == "--jit") {
+      // Runs the "seven" side of every comparison through seven-jit's JitExecutor instead of
+      // seven_core's plain interpreter -- same TestCase, same Unicorn/hardware oracles, just a
+      // different engine under test. Off by default so a bare run still verifies the interpreter,
+      // which is what most of this fuzzer's existing findings/methodology assumes.
+      use_jit = true;
     } else if (a == "--no-unicorn") {
       g_no_unicorn = true;
     } else if (a == "--no-seven") {
@@ -378,9 +415,25 @@ int main(int argc, char** argv) {
   if (threads > iterations) threads = static_cast<unsigned int>(iterations == 0 ? 1 : iterations);
   if (threads == 0) threads = 1;
 
-  std::printf("seven-fuzzer: iterations=%llu seed=0x%llX hw=%s threads=%u\n",
+  // --jit is clamped to one thread until seven-jit's compiled code carries real Windows SEH
+  // unwind info (asmjit never calls RtlAddFunctionTable for the executable memory it hands out).
+  // A hardware fault while a compiled block is actually on the call stack -- routine under random
+  // fuzzing, and normally caught cleanly by this process's own SEH translator -- has undefined
+  // unwind behavior without that, and multi-threaded --jit runs reproduce a hard, unrecoverable
+  // crash far faster than single-threaded ones do (observed within a couple dozen iterations per
+  // worker vs. a clean 20000+ single-threaded). See block_compiler.cpp's RuntimeKeepalive comment
+  // for the full investigation. Remove this clamp once that's fixed.
+  if (use_jit && threads > 1) {
+    std::printf(
+        "seven-fuzzer: --jit is not yet safe multi-threaded (missing SEH unwind info for JIT "
+        "code) -- clamping threads %u -> 1\n",
+        threads);
+    threads = 1;
+  }
+
+  std::printf("seven-fuzzer: iterations=%llu seed=0x%llX hw=%s engine=%s threads=%u\n",
               static_cast<unsigned long long>(iterations), static_cast<unsigned long long>(seed),
-              use_hw ? "on" : "off", threads);
+              use_hw ? "on" : "off", use_jit ? "seven-jit" : "seven", threads);
   std::fflush(stdout);
 
   const std::string findings_dir = exe_dir() + "/findings";
@@ -393,8 +446,8 @@ int main(int argc, char** argv) {
   const std::uint64_t remainder = iterations % threads;
   for (unsigned int w = 0; w < threads; ++w) {
     const std::uint64_t share = base_share + (w < remainder ? 1 : 0);
-    pool.emplace_back(run_worker, static_cast<int>(w), share, seed, use_hw, iterations, verbose_from, findings_dir,
-                       outliers_dir, std::ref(counters));
+    pool.emplace_back(run_worker, static_cast<int>(w), share, seed, use_hw, use_jit, iterations, verbose_from,
+                       findings_dir, outliers_dir, std::ref(counters));
   }
   for (auto& t : pool) t.join();
 

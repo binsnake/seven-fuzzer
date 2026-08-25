@@ -41,9 +41,9 @@ void append_outcome(std::string& out, const char* label, const LaneOutcome& o) {
 
 }  // namespace
 
-std::string write_finding(const std::string& findings_dir, int index, const TestCase& tc, const LaneOutcome& seven,
-                           const LaneOutcome& unicorn, const LaneOutcome& hw, bool hw_available,
-                           const std::vector<Divergence>& divergences) {
+std::string write_finding(const std::string& findings_dir, int index, const TestCase& tc, const char* seven_label,
+                           const LaneOutcome& seven, const LaneOutcome& unicorn, const LaneOutcome& hw,
+                           bool hw_available, const std::vector<Divergence>& divergences) {
   std::filesystem::create_directories(findings_dir);
   char name[64];
   std::snprintf(name, sizeof(name), "/finding_%06d.txt", index);
@@ -72,7 +72,7 @@ std::string write_finding(const std::string& findings_dir, int index, const Test
   }
   out += "\n";
 
-  append_outcome(out, "seven", seven);
+  append_outcome(out, seven_label, seven);
   append_outcome(out, "unicorn", unicorn);
   if (hw_available) {
     append_outcome(out, "hardware", hw);

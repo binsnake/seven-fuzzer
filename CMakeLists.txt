@@ -24,12 +24,16 @@ include(FetchContent)
 
 set(SEVEN_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../seven-emulator" CACHE PATH "Path to the seven-emulator checkout")
 set(SOGEN_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../sogen" CACHE PATH "Path to the sogen checkout")
+set(SEVEN_JIT_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../seven-jit" CACHE PATH "Path to the seven-jit checkout")
 
 if(NOT EXISTS "${SEVEN_ROOT}/seven_core/include/seven/compat.hpp")
   message(FATAL_ERROR "SEVEN_ROOT (${SEVEN_ROOT}) doesn't look like a seven-emulator checkout")
 endif()
 if(NOT EXISTS "${SOGEN_ROOT}/deps/unicorn/CMakeLists.txt")
   message(FATAL_ERROR "SOGEN_ROOT (${SOGEN_ROOT}) doesn't look like a sogen checkout")
+endif()
+if(NOT EXISTS "${SEVEN_JIT_ROOT}/seven_jit/include/seven_jit/jit_executor.hpp")
+  message(FATAL_ERROR "SEVEN_JIT_ROOT (${SEVEN_JIT_ROOT}) doesn't look like a seven-jit checkout")
 endif()
 
 set(SEVEN_VECTOR_BITS 512)
@@ -116,6 +120,36 @@ if(MSVC)
   target_compile_options(seven_core PRIVATE /WX-)
 endif()
 
+# ------------------------------------------------------------------- seven_jit
+# BlockCompiler/JitExecutor, reused read-only from the sibling seven-jit checkout, linked straight
+# against the seven_core target built above -- SEVEN_ROOT and seven-jit's own vendor/seven-emulator
+# submodule both need to be on binsnake/seven-emulator's jit/flag-liveness-execution-model-fix
+# branch (or later) for this to compile, since JitExecutor depends on APIs that branch added
+# (jit_bypass_eligible, page_code_epoch, dispatch_handler, is_trap_instruction,
+# simd_profile_allows, the JIT-visible memory TLB). There is deliberately only ONE seven_core
+# target in this whole binary -- seven-jit's own CMakeLists.txt is never included, only its
+# BlockCompiler/JitExecutor .cpp files are compiled directly against the seven_core already built
+# above, so there's no risk of two same-named static libs colliding at link time.
+
+set(ASMJIT_STATIC ON CACHE BOOL "" FORCE)
+set(ASMJIT_TEST OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(
+  asmjit
+  GIT_REPOSITORY https://github.com/asmjit/asmjit.git
+  GIT_TAG        master
+)
+FetchContent_MakeAvailable(asmjit)
+
+add_library(seven_jit STATIC
+  ${SEVEN_JIT_ROOT}/seven_jit/src/block_compiler.cpp
+  ${SEVEN_JIT_ROOT}/seven_jit/src/jit_executor.cpp
+)
+target_include_directories(seven_jit PUBLIC "${SEVEN_JIT_ROOT}/seven_jit/include")
+target_link_libraries(seven_jit PUBLIC seven_core asmjit::asmjit)
+if(MSVC)
+  target_compile_options(seven_jit PRIVATE /WX-)
+endif()
+
 # -------------------------------------------------------------------- unicorn
 # Built from sogen's own vendored submodule/commit so the "unicorn" lane
 # matches what sogen's default backend actually runs, not an unrelated
@@ -136,13 +170,14 @@ endif()
 add_executable(seven_fuzzer
   src/main.cpp
   src/lanes/seven_lane.cpp
+  src/lanes/seven_jit_lane.cpp
   src/lanes/unicorn_lane.cpp
   src/lanes/hardware_lane.cpp
   src/gen/instruction_gen.cpp
   src/report/report.cpp
 )
 target_include_directories(seven_fuzzer PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
-target_link_libraries(seven_fuzzer PRIVATE seven_core unicorn advapi32)
+target_link_libraries(seven_fuzzer PRIVATE seven_core seven_jit unicorn advapi32)
 add_dependencies(seven_fuzzer seven_fuzz_victim)
 if(MSVC)
   target_compile_options(seven_fuzzer PRIVATE /WX- /Zc:__cplusplus /permissive-)
