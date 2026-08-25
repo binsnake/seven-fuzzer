@@ -15,6 +15,7 @@
 // parallelizing it worthwhile.
 //
 // Usage: seven_fuzzer.exe [iterations] [seed] [--no-hw] [--jit] [--threads N] [--verbose-from N]
+//                          [--watchdog-seconds N]
 //
 // --jit runs the "seven" side through seven-jit's JitExecutor instead of seven_core's plain
 // interpreter (see lanes/seven_jit_lane.hpp) -- everything else about the run (TestCase generation,
@@ -32,6 +33,7 @@
 #include <dbghelp.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <eh.h>
@@ -82,6 +84,30 @@ LONG WINAPI write_crash_dump(EXCEPTION_POINTERS* ep) {
                   ep->ExceptionRecord->ExceptionCode, ep->ExceptionRecord->ExceptionAddress, dump_path.c_str());
   }
   return EXCEPTION_EXECUTE_HANDLER;  // terminate after dumping
+}
+
+// Called from the watchdog thread when a worker stops making progress -- unlike
+// write_crash_dump above, there's no exception to hang the dump off of, so this
+// snapshots every thread's current stack as-is. That's exactly what's needed for
+// the known single-threaded --jit hang (see the --jit thread-clamp comment in
+// main()): it lets the actual stuck call stack be inspected after the fact,
+// instead of needing cdb attached live at the moment it happens.
+void write_hang_dump() {
+  wchar_t path[MAX_PATH];
+  const DWORD n = GetModuleFileNameW(nullptr, path, MAX_PATH);
+  std::wstring dir(path, n);
+  const auto pos = dir.find_last_of(L"\\/");
+  if (pos != std::wstring::npos) dir.resize(pos);
+  const std::wstring dump_path = dir + L"\\watchdog_hang.dmp";
+
+  HANDLE file = CreateFileW(dump_path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (file != INVALID_HANDLE_VALUE) {
+    MiniDumpWriteDump(GetCurrentProcess(), GetCurrentProcessId(), file,
+                       static_cast<MINIDUMP_TYPE>(MiniDumpWithFullMemory | MiniDumpWithHandleData | MiniDumpWithThreadInfo),
+                       nullptr, nullptr, nullptr);
+    CloseHandle(file);
+    std::fwprintf(stderr, L"[watchdog] wrote %s\n", dump_path.c_str());
+  }
 }
 
 std::string exe_dir() {
@@ -186,9 +212,59 @@ struct SharedCounters {
   std::mutex compute_mutex;
 };
 
+// One entry per worker, updated from that worker's own thread every TestCase and read from the
+// watchdog thread -- see run_watchdog below. local_i plus the worker's id is enough to reproduce
+// deterministically (InstructionGenerator is fully seeded from mix_seed(seed, worker_id)), so the
+// diagnostic doesn't need to carry the TestCase text itself and can stay lock-free in the hot loop.
+struct WorkerHeartbeat {
+  std::atomic<std::uint64_t> last_tick_ms{0};
+  std::atomic<std::uint64_t> local_i{0};
+  std::atomic<bool> finished{false};
+};
+
+// Last-resort safety net for the known single-threaded --jit hang (Unicorn's TCG-vs-asmjit
+// allocator interaction, see the --jit thread-clamp comment in main()) and, more generally, for
+// any future hang this fuzzer wasn't specifically designed around: an unattended overnight run
+// should always terminate on its own rather than sit stuck forever with no one watching. Polls
+// each worker's heartbeat; a worker that hasn't started a new TestCase within the timeout gets a
+// live minidump (captures the actually-stuck call stack, no need to catch it under a debugger) and
+// the whole process is torn down immediately -- there's no way to safely cancel just the one stuck
+// thread out from under vendored Unicorn/asmjit state, and a hard kill with a clear exit code beats
+// an unattended run hanging indefinitely.
+void run_watchdog(std::vector<WorkerHeartbeat>& heartbeats, unsigned int watchdog_seconds, std::mutex& io_mutex) {
+  if (watchdog_seconds == 0) return;  // --watchdog-seconds 0 disables it
+  const std::uint64_t timeout_ms = static_cast<std::uint64_t>(watchdog_seconds) * 1000ull;
+  for (;;) {
+    std::this_thread::sleep_for(std::chrono::seconds(2));
+    const std::uint64_t now = GetTickCount64();
+    bool all_finished = true;
+    for (std::size_t w = 0; w < heartbeats.size(); ++w) {
+      if (heartbeats[w].finished.load(std::memory_order_relaxed)) continue;
+      all_finished = false;
+      const std::uint64_t last = heartbeats[w].last_tick_ms.load(std::memory_order_relaxed);
+      if (now - last > timeout_ms) {
+        {
+          std::lock_guard<std::mutex> lock(io_mutex);
+          std::printf(
+              "[watchdog] worker %zu appears hung: no progress for over %u seconds, stuck at local "
+              "iteration %llu. Writing a live minidump and terminating so an unattended run doesn't "
+              "hang forever -- rerun with --threads 1 and the same seed to reach this worker's "
+              "iteration range and reproduce.\n",
+              w, watchdog_seconds, static_cast<unsigned long long>(heartbeats[w].local_i.load(std::memory_order_relaxed)));
+          std::fflush(stdout);
+        }
+        write_hang_dump();
+        TerminateProcess(GetCurrentProcess(), 2);
+      }
+    }
+    if (all_finished) return;
+  }
+}
+
 void run_worker(int worker_id, std::uint64_t iterations, std::uint64_t seed, bool use_hw, bool use_jit,
                  std::uint64_t total_iterations, std::uint64_t verbose_from, const std::string& findings_dir,
-                 const std::string& outliers_dir, SharedCounters& counters) {
+                 const std::string& outliers_dir, SharedCounters& counters, WorkerHeartbeat& heartbeat) {
+  heartbeat.last_tick_ms.store(GetTickCount64(), std::memory_order_relaxed);
   _set_se_translator(seh_translator);
   InstructionGenerator gen(mix_seed(seed, worker_id));
   HardwareSession hw;
@@ -228,6 +304,8 @@ void run_worker(int worker_id, std::uint64_t iterations, std::uint64_t seed, boo
   constexpr std::uint64_t kJitRecycleInterval = 2000;
 
   for (std::uint64_t local_i = 0; local_i < iterations; ++local_i) {
+    heartbeat.last_tick_ms.store(GetTickCount64(), std::memory_order_relaxed);
+    heartbeat.local_i.store(local_i, std::memory_order_relaxed);
     if (use_jit && local_i != 0 && local_i % kJitRecycleInterval == 0) {
       jit_executor.recycle();
     }
@@ -329,21 +407,25 @@ void run_worker(int worker_id, std::uint64_t iterations, std::uint64_t seed, boo
       std::printf("[worker %d][local %llu] CRASH: structured exception 0x%08X at %p while running (%s)\n", worker_id,
                   static_cast<unsigned long long>(local_i), e.code, e.address, tc.text.c_str());
       std::fflush(stdout);
+      heartbeat.finished.store(true, std::memory_order_relaxed);
       return;
     } catch (const std::exception& e) {
       std::lock_guard<std::mutex> lock(counters.io_mutex);
       std::printf("[worker %d][local %llu] CRASH: C++ exception (%s) while running (%s)\n", worker_id,
                   static_cast<unsigned long long>(local_i), e.what(), tc.text.c_str());
       std::fflush(stdout);
+      heartbeat.finished.store(true, std::memory_order_relaxed);
       return;
     } catch (...) {
       std::lock_guard<std::mutex> lock(counters.io_mutex);
       std::printf("[worker %d][local %llu] CRASH: unknown exception while running (%s)\n", worker_id,
                   static_cast<unsigned long long>(local_i), tc.text.c_str());
       std::fflush(stdout);
+      heartbeat.finished.store(true, std::memory_order_relaxed);
       return;
     }
   }
+  heartbeat.finished.store(true, std::memory_order_relaxed);
 }
 
 }  // namespace
@@ -356,11 +438,14 @@ int main(int argc, char** argv) {
   bool use_jit = false;
   std::uint64_t verbose_from = UINT64_MAX;
   unsigned int threads = 0;  // 0 = auto
+  unsigned int watchdog_seconds = 60;  // 0 disables; see run_watchdog
 
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
     if (a == "--no-hw") {
       use_hw = false;
+    } else if (a == "--watchdog-seconds" && i + 1 < argc) {
+      watchdog_seconds = static_cast<unsigned int>(std::strtoul(argv[++i], nullptr, 10));
     } else if (a == "--jit") {
       // Runs the "seven" side of every comparison through seven-jit's JitExecutor instead of
       // seven_core's plain interpreter -- same TestCase, same Unicorn/hardware oracles, just a
@@ -448,9 +533,24 @@ int main(int argc, char** argv) {
   // which rules out a fixed per-run iteration threshold as a safe bound. Root cause not fully
   // pinned down (unclear whether this is the same missing-unwind-info hazard as above manifesting
   // differently, or a separate address-space-exhaustion retry loop inside Unicorn's own allocator);
-  // not something to guess-fix without room to verify. Wrap any unattended --jit run in an
-  // external wall-clock timeout (e.g. `timeout` on Linux, a job object or scheduled-task deadline
-  // on Windows) rather than trusting it to always terminate on its own.
+  // not something to guess-fix without room to verify.
+  //
+  // Checked and ruled out as the mechanism here: this vendored Unicorn's uc_close() DOES correctly
+  // call may_remove_handler() (via release_common -> free_code_gen_buffer, wired through
+  // uc->release = x86_release in target/i386/unicorn.c) before freeing the engine, so the
+  // Windows-only lazy-commit VEH it registers per uc_open() is properly torn down every call --
+  // there is no leaked/stale vectored handler accumulating across the fresh-engine-per-TestCase
+  // cycle run_unicorn does. An earlier pass through this file assumed otherwise and prototyped
+  // reusing one Unicorn engine across calls to avoid the (nonexistent) leak; that reuse design was
+  // reverted after it reintroduced real correctness bugs of its own (stale translation-block cache
+  // and an exception-hook/engine-reuse interaction both producing false divergences) chasing a
+  // problem that wasn't actually there. Left as an open question for whoever picks this back up.
+  //
+  // Unattended runs no longer rely solely on an external wrapper for this: main() below spawns a
+  // watchdog thread (run_watchdog) that terminates the process and writes a live minidump if a
+  // worker stops making progress, so a hang here is now bounded and postmortem-debuggable without
+  // needing to catch it live under cdb. Still worth wrapping in an external wall-clock timeout too
+  // (e.g. `timeout` on Linux, a job object or scheduled-task deadline on Windows) as a second layer.
   if (use_jit && threads > 1) {
     std::printf(
         "seven-fuzzer: --jit is not yet safe multi-threaded (missing SEH unwind info for JIT "
@@ -464,9 +564,18 @@ int main(int argc, char** argv) {
               use_hw ? "on" : "off", use_jit ? "seven-jit" : "seven", threads);
   std::fflush(stdout);
 
+  if (watchdog_seconds != 0) {
+    std::printf("seven-fuzzer: watchdog armed, %u second timeout (--watchdog-seconds 0 to disable)\n",
+                watchdog_seconds);
+  }
+  std::fflush(stdout);
+
   const std::string findings_dir = exe_dir() + "/findings";
   const std::string outliers_dir = exe_dir() + "/unicorn_outliers";
   SharedCounters counters;
+  std::vector<WorkerHeartbeat> heartbeats(threads);
+
+  std::thread watchdog_thread(run_watchdog, std::ref(heartbeats), watchdog_seconds, std::ref(counters.io_mutex));
 
   std::vector<std::thread> pool;
   pool.reserve(threads);
@@ -475,9 +584,10 @@ int main(int argc, char** argv) {
   for (unsigned int w = 0; w < threads; ++w) {
     const std::uint64_t share = base_share + (w < remainder ? 1 : 0);
     pool.emplace_back(run_worker, static_cast<int>(w), share, seed, use_hw, use_jit, iterations, verbose_from,
-                       findings_dir, outliers_dir, std::ref(counters));
+                       findings_dir, outliers_dir, std::ref(counters), std::ref(heartbeats[w]));
   }
   for (auto& t : pool) t.join();
+  watchdog_thread.join();
 
   std::printf("done. findings=%d unicorn_only_outliers=%llu hw_harness_errors=%llu\n",
               counters.finding_count.load(), static_cast<unsigned long long>(counters.unicorn_outlier_count.load()),
