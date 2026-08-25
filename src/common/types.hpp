@@ -61,6 +61,15 @@ struct TestCase {
   // (e.g. BSF/BSR-of-zero has its own undefined-destination behavior) but
   // shouldn't be the *only* value ever exercised.
   std::array<std::uint8_t, kDataWindow> data_seed{};
+  // Bit i set means GPR i is meaningful to compare across lanes. BSF/BSR
+  // leave the destination register's value fully undefined by spec when the
+  // source operand is zero -- confirmed via the --probe-bsr-zero ground
+  // truth check that real hardware leaves it completely untouched while
+  // Unicorn incorrectly zero-extends it (seven's interpreter and seven-jit's
+  // callout bridge both correctly match hardware here). The generator clears
+  // the destination's bit when it detects this exact case so the comparator
+  // doesn't report a known Unicorn quirk as a seven/seven-jit finding.
+  std::uint32_t gpr_compare_mask = 0xFFFFu;
 };
 
 // Normalized fault vocabulary every lane maps its own exception model onto.

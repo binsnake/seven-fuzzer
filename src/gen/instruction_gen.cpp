@@ -79,6 +79,14 @@ struct Ctx {
   // in-range case instead of the near-certain #DE a fully random pair
   // would produce). Index is x86 register numbering, same as RegState::gpr.
   std::array<std::optional<std::uint64_t>, 16> force_gpr{};
+  // BSF/BSR-specific: recorded so next() can check the ACTUAL runtime source
+  // value after registers/data are randomized and clear gpr_compare_mask's
+  // destination bit only when that source turns out to be zero. See
+  // TestCase::gpr_compare_mask's comment for why.
+  std::optional<int> bsf_bsr_dest;
+  std::optional<int> bsf_bsr_src_reg;
+  std::optional<std::int8_t> bsf_bsr_src_mem_disp;
+  int bsf_bsr_width_bytes = 0;
 };
 
 [[nodiscard]] int rand_int(std::mt19937_64& rng, int lo, int hi) {
@@ -534,7 +542,8 @@ const std::array<const RmSrcCodes*, 5> kRmSrcFamily = {&kBsf, &kBsr, &kPopcnt, &
 
 [[nodiscard]] std::optional<Instruction> gen_rmsrc(Ctx& c) {
   const int pick = rand_int(c.rng, 0, 4);
-  if (pick == 0 || pick == 1) {
+  const bool is_bsf_bsr = pick == 0 || pick == 1;
+  if (is_bsf_bsr) {
     // BSF/BSR define only ZF; CF/OF/SF/AF/PF are architecturally undefined
     // (unlike POPCNT/LZCNT/TZCNT, which fully define all of them).
     c.flags_mask = 0x0040ull;
@@ -545,10 +554,21 @@ const std::array<const RmSrcCodes*, 5> kRmSrcFamily = {&kBsf, &kBsr, &kPopcnt, &
   const int d = pick_reg_index(c.rng);
   if (rand_int(c.rng, 0, 1) == 0) {
     const int s = pick_reg_index(c.rng);
+    if (is_bsf_bsr) {
+      c.bsf_bsr_dest = d;
+      c.bsf_bsr_src_reg = s;
+      c.bsf_bsr_width_bytes = bits_of(w) / 8;
+    }
     return InstructionFactory::with2(t.code[wi], reg_of(w, d), reg_of(w, s));
   }
   c.touches_memory = true;
-  return InstructionFactory::with2(t.code[wi], reg_of(w, d), mem_operand(random_disp8(c.rng)));
+  const std::int8_t disp = random_disp8(c.rng);
+  if (is_bsf_bsr) {
+    c.bsf_bsr_dest = d;
+    c.bsf_bsr_src_mem_disp = disp;
+    c.bsf_bsr_width_bytes = bits_of(w) / 8;
+  }
+  return InstructionFactory::with2(t.code[wi], reg_of(w, d), mem_operand(disp));
 }
 
 [[nodiscard]] std::optional<Instruction> gen_bswap(Ctx& c) {
@@ -937,6 +957,30 @@ TestCase InstructionGenerator::next() {
       tc.initial.rflags = fl;
 
       for (auto& b : tc.data_seed) b = static_cast<std::uint8_t>(rand_int(rng_, 0, 255));
+
+      if (c.bsf_bsr_dest.has_value()) {
+        std::uint64_t src_val = 0;
+        bool have_src = false;
+        if (c.bsf_bsr_src_reg.has_value()) {
+          src_val = tc.initial.gpr[static_cast<std::size_t>(*c.bsf_bsr_src_reg)];
+          have_src = true;
+        } else if (c.bsf_bsr_src_mem_disp.has_value()) {
+          const auto off = static_cast<std::size_t>(*c.bsf_bsr_src_mem_disp);
+          if (off + static_cast<std::size_t>(c.bsf_bsr_width_bytes) <= tc.data_seed.size()) {
+            for (int b = 0; b < c.bsf_bsr_width_bytes; ++b) {
+              src_val |= static_cast<std::uint64_t>(tc.data_seed[off + static_cast<std::size_t>(b)])
+                         << (8 * b);
+            }
+            have_src = true;
+          }
+        }
+        if (have_src && c.bsf_bsr_width_bytes > 0 && c.bsf_bsr_width_bytes < 8) {
+          src_val &= (std::uint64_t{1} << (8 * c.bsf_bsr_width_bytes)) - 1;
+        }
+        if (have_src && src_val == 0) {
+          tc.gpr_compare_mask &= ~(1u << *c.bsf_bsr_dest);
+        }
+      }
 
       return tc;
     } catch (...) {

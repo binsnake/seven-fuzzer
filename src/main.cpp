@@ -162,7 +162,7 @@ std::uint64_t mix_seed(std::uint64_t base, int worker_id) {
 }
 
 void diff_pair(const char* label, const LaneOutcome& a, const LaneOutcome& b, std::uint64_t flags_mask,
-               std::vector<Divergence>& out) {
+               std::uint32_t gpr_compare_mask, std::vector<Divergence>& out) {
   if (!a.setup_ok || !b.setup_ok) return;  // harness hiccup, not a finding
   Divergence d;
   d.pairing = label;
@@ -176,6 +176,7 @@ void diff_pair(const char* label, const LaneOutcome& a, const LaneOutcome& b, st
     static const char* kNames[16] = {"rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi",
                                       "r8",  "r9",  "r10", "r11", "r12", "r13", "r14", "r15"};
     for (int i = 0; i < 16; ++i) {
+      if (((gpr_compare_mask >> i) & 1u) == 0) continue;  // e.g. BSF/BSR-zero-source, see TestCase::gpr_compare_mask
       if (a.after.gpr[static_cast<std::size_t>(i)] != b.after.gpr[static_cast<std::size_t>(i)]) {
         std::snprintf(buf, sizeof(buf), "%s: %016llX vs %016llX", kNames[i],
                       static_cast<unsigned long long>(a.after.gpr[static_cast<std::size_t>(i)]),
@@ -366,10 +367,11 @@ void run_worker(int worker_id, std::uint64_t iterations, std::uint64_t seed, boo
     }
 
     std::vector<Divergence> seven_vs_unicorn, seven_vs_hw, unicorn_vs_hw;
-    diff_pair(seven_vs_unicorn_label.c_str(), seven_out, unicorn_out, tc.flags_mask, seven_vs_unicorn);
+    diff_pair(seven_vs_unicorn_label.c_str(), seven_out, unicorn_out, tc.flags_mask, tc.gpr_compare_mask,
+              seven_vs_unicorn);
     if (hw_ok_this_round) {
-      diff_pair(seven_vs_hw_label.c_str(), seven_out, hw_out, tc.flags_mask, seven_vs_hw);
-      diff_pair("unicorn-vs-hw", unicorn_out, hw_out, tc.flags_mask, unicorn_vs_hw);
+      diff_pair(seven_vs_hw_label.c_str(), seven_out, hw_out, tc.flags_mask, tc.gpr_compare_mask, seven_vs_hw);
+      diff_pair("unicorn-vs-hw", unicorn_out, hw_out, tc.flags_mask, tc.gpr_compare_mask, unicorn_vs_hw);
     }
 
     // When hardware is available and seven matches it exactly, a
