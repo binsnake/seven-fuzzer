@@ -431,11 +431,26 @@ int main(int argc, char** argv) {
   // --jit is clamped to one thread until seven-jit's compiled code carries real Windows SEH
   // unwind info (asmjit never calls RtlAddFunctionTable for the executable memory it hands out).
   // A hardware fault while a compiled block is actually on the call stack -- routine under random
-  // fuzzing, and normally caught cleanly by this process's own SEH translator -- has undefined
-  // unwind behavior without that, and multi-threaded --jit runs reproduce a hard, unrecoverable
-  // crash far faster than single-threaded ones do (observed within a couple dozen iterations per
-  // worker vs. a clean 20000+ single-threaded). See block_compiler.cpp's RuntimeKeepalive comment
-  // for the full investigation. Remove this clamp once that's fixed.
+  // fuzzing -- has undefined unwind behavior without that, and multi-threaded --jit runs reproduce
+  // a hard, unrecoverable crash far faster than single-threaded ones do (observed within a couple
+  // dozen iterations per worker). See block_compiler.cpp's RuntimeKeepalive comment for the full
+  // investigation. Remove this clamp once that's fixed.
+  //
+  // Single-threaded --jit is NOT fully immune either, and the failure mode there is worse than a
+  // clean catch: Unicorn opens/closes a fresh engine every single TestCase (see run_unicorn), and
+  // its own TCG prologue codegen (tcg_out8/tcg_target_qemu_prologue, ordinary compiled code, not
+  // JIT-generated) can crash writing into its own code buffer after enough alloc/free cycles have
+  // interleaved with asmjit's own allocator -- confirmed via cdb, and confirmed to need --jit
+  // specifically (the exact same seeds run cleanly through 20000+ iterations without it). That
+  // particular crash IS caught cleanly by the SEH translator below (worker prints CRASH and stops).
+  // But the same interaction has also been observed to hang indefinitely instead -- no crash
+  // printed, no forward progress -- on seeds where the clean-crash variant does NOT reproduce,
+  // which rules out a fixed per-run iteration threshold as a safe bound. Root cause not fully
+  // pinned down (unclear whether this is the same missing-unwind-info hazard as above manifesting
+  // differently, or a separate address-space-exhaustion retry loop inside Unicorn's own allocator);
+  // not something to guess-fix without room to verify. Wrap any unattended --jit run in an
+  // external wall-clock timeout (e.g. `timeout` on Linux, a job object or scheduled-task deadline
+  // on Windows) rather than trusting it to always terminate on its own.
   if (use_jit && threads > 1) {
     std::printf(
         "seven-fuzzer: --jit is not yet safe multi-threaded (missing SEH unwind info for JIT "

@@ -41,6 +41,47 @@ constexpr std::array<int, 16> kXmmRegIds = {
   }
 }
 
+// uc_emu_start only ever returns UC_ERR_EXCEPTION for a genuine CPU-raised exception (divide
+// error, #UD via a decodable-but-architecturally-illegal encoding, #GP, an internal #PF distinct
+// from the already-handled unmapped/protected-memory cases above) -- it carries no detail about
+// WHICH exception fired. That detail only exists inside QEMU's own exception dispatch
+// (cpu_handle_exception in accel/tcg/cpu-exec.c), which hands the exception vector to any
+// registered UC_HOOK_INTR callback before falling back to UC_ERR_EXCEPTION -- without a hook
+// registered, every one of those distinct exceptions collapses into the same generic "other"
+// bucket. Found via a real seven-fuzzer run: seven's interpreter correctly reports stop=de for an
+// IDIV overflow/divide-by-zero, but the unicorn lane reported stop=other, a false-positive
+// divergence -- not a real behavioral difference, just this lane failing to decode its own
+// engine's exception report. Vector numbers match QEMU's target/i386/cpu.h EXCP00_DIVZ=0/
+// EXCP06_ILLOP=6/EXCP0D_GPF=13/EXCP0E_PAGE=14, which are the real x86 architectural exception
+// vectors, not unicorn-specific values.
+// Merely registering a UC_HOOK_INTR callback changes unicorn's own behavior on an unhandled CPU
+// exception: cpu_handle_exception (accel/tcg/cpu-exec.c) treats the exception as "caught" the
+// moment ANY UC_HOOK_INTR hook exists, regardless of what the hook does, and resumes emulation
+// instead of stopping with UC_ERR_EXCEPTION -- confirmed empirically (a first version of this hook
+// that only recorded intno turned every "stop=de" case into a false "stop=ok", strictly worse than
+// the undifferentiated "other" this replaces). uc_emu_stop() forces the run to actually halt right
+// here, matching what would have happened with no hook registered at all, just with intno now
+// captured on the way out.
+void hook_intr(uc_engine* uc, std::uint32_t intno, void* user_data) {
+  *static_cast<std::uint32_t*>(user_data) = intno;
+  uc_emu_stop(uc);
+}
+
+[[nodiscard]] Stop map_intno(std::uint32_t intno) noexcept {
+  switch (intno) {
+    case 0:
+      return Stop::de;
+    case 6:
+      return Stop::ud;
+    case 13:
+      return Stop::gp;
+    case 14:
+      return Stop::pf;
+    default:
+      return Stop::other;
+  }
+}
+
 }  // namespace
 
 LaneOutcome run_unicorn(const TestCase& tc) {
@@ -91,10 +132,26 @@ LaneOutcome run_unicorn(const TestCase& tc) {
     }
   }
 
+  // See hook_intr's comment: without this, every CPU-raised exception (divide error, #GP, ...)
+  // collapses into the same undifferentiated UC_ERR_EXCEPTION/Stop::other bucket, producing
+  // false-positive divergences against seven's interpreter reporting the correct specific stop
+  // reason for the exact same fault.
+  std::uint32_t intno = 0xFFFFFFFFu;
+  uc_hook intr_hook{};
+  uc_hook_add(uc, &intr_hook, UC_HOOK_INTR, reinterpret_cast<void*>(&hook_intr), &intno, 1, 0);
+
   // count=1 stops after exactly one instruction; `until` is unreachable so
   // count is what actually bounds it (standard unicorn single-step idiom).
   err = uc_emu_start(uc, kCodeBase, 0xFFFFFFFFFFFFFFFFull, 0, 1);
-  out.stop = map_uc_err(err);
+  // intno being set at all is proof positive a CPU exception fired during this step (hook_intr's
+  // uc_emu_stop() forces uc_emu_start to return before the count=1 budget would otherwise report
+  // UC_ERR_OK) -- that takes priority over err itself, which the hook's mere presence already
+  // steers away from UC_ERR_EXCEPTION.
+  if (intno != 0xFFFFFFFFu) {
+    out.stop = map_intno(intno);
+  } else {
+    out.stop = map_uc_err(err);
+  }
   if (out.stop == Stop::other) {
     out.detail = std::string("unicorn uc_err=") + uc_strerror(err);
   }
