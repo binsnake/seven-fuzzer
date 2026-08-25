@@ -71,11 +71,26 @@ void read_gpr_from_context(const CONTEXT& ctx, RegState& r) {
   r.rflags = ctx.EFlags;
 }
 
-[[nodiscard]] Stop map_exception(DWORD code) noexcept {
-  switch (code) {
+// Windows collapses a genuine x86 #GP into the SAME STATUS_ACCESS_VIOLATION (0xC0000005) code it
+// uses for a real #PF -- confirmed empirically via a standalone VectoredExceptionHandler probe
+// (a deliberately misaligned legacy MOVAPS memory operand, which the SDM guarantees #GP(0) for):
+// the resulting exception record showed ExceptionInformation[0] == 0 and
+// ExceptionInformation[1] == ULONG_PTR(-1) -- there's no CR2 equivalent for #GP, so the kernel has
+// no real faulting address to report and leaves that slot as an all-ones sentinel instead. A
+// genuine #PF always carries a real faulting virtual address there. This was previously
+// misclassified as Stop::pf, which is what made the legacy-SSE-alignment #GP fix elsewhere in this
+// repo look like it hadn't changed anything against the hardware lane -- it had, this was just
+// mislabeled. Reclassify only that exact, unambiguous sentinel shape; anything else (including a
+// real #PF that happens to have NumberParameters>=2 with a real address) keeps its normal pf
+// classification.
+[[nodiscard]] Stop map_exception(const EXCEPTION_RECORD& rec) noexcept {
+  switch (rec.ExceptionCode) {
     case EXCEPTION_SINGLE_STEP:
       return Stop::ok;
-    case EXCEPTION_ACCESS_VIOLATION:
+    case EXCEPTION_ACCESS_VIOLATION: {
+      const bool gp_shaped = rec.NumberParameters >= 2 && rec.ExceptionInformation[1] == static_cast<ULONG_PTR>(-1);
+      return gp_shaped ? Stop::gp : Stop::pf;
+    }
     case EXCEPTION_ARRAY_BOUNDS_EXCEEDED:
     case EXCEPTION_IN_PAGE_ERROR:
       return Stop::pf;
@@ -446,12 +461,16 @@ struct HardwareSession::Impl {
           teardown();
           return out;
         case EXCEPTION_DEBUG_EVENT: {
-          const DWORD code = de.u.Exception.ExceptionRecord.ExceptionCode;
-          out.stop = map_exception(code);
+          const auto& rec = de.u.Exception.ExceptionRecord;
+          const DWORD code = rec.ExceptionCode;
+          out.stop = map_exception(rec);
           {
             char buf[96];
-            const auto& rec = de.u.Exception.ExceptionRecord;
-            if (code == EXCEPTION_ACCESS_VIOLATION && rec.NumberParameters >= 2) {
+            if (code == EXCEPTION_ACCESS_VIOLATION && out.stop == Stop::gp) {
+              std::snprintf(buf, sizeof(buf), "gp (access violation, no real fault address) (rip=0x%016llX)",
+                            static_cast<unsigned long long>(reinterpret_cast<std::uint64_t>(rec.ExceptionAddress)));
+              out.detail = buf;
+            } else if (code == EXCEPTION_ACCESS_VIOLATION && rec.NumberParameters >= 2) {
               std::snprintf(buf, sizeof(buf), "av %s at 0x%016llX (rip=0x%016llX)",
                             rec.ExceptionInformation[0] == 8 ? "exec" : rec.ExceptionInformation[0] == 1 ? "write" : "read",
                             static_cast<unsigned long long>(rec.ExceptionInformation[1]),
