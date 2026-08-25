@@ -76,12 +76,26 @@ LONG WINAPI write_crash_dump(EXCEPTION_POINTERS* ep) {
     mei.ThreadId = GetCurrentThreadId();
     mei.ExceptionPointers = ep;
     mei.ClientPointers = FALSE;
-    MiniDumpWriteDump(GetCurrentProcess(), GetCurrentProcessId(), file,
-                       static_cast<MINIDUMP_TYPE>(MiniDumpWithFullMemory | MiniDumpWithHandleData | MiniDumpWithThreadInfo),
-                       &mei, nullptr, nullptr);
+    // This has been observed to fail silently (0-byte dump, no diagnostic) when the crash is severe
+    // enough that the process's own heap/CRT state is too corrupted for MiniDumpWriteDump to walk --
+    // logging the failure here at least tells the next person that happened, instead of leaving a
+    // mysteriously-empty dump file with no explanation.
+    const BOOL wrote = MiniDumpWriteDump(
+        GetCurrentProcess(), GetCurrentProcessId(), file,
+        static_cast<MINIDUMP_TYPE>(MiniDumpWithFullMemory | MiniDumpWithHandleData | MiniDumpWithThreadInfo), &mei,
+        nullptr, nullptr);
+    const DWORD dump_err = wrote ? 0 : GetLastError();
     CloseHandle(file);
-    std::fwprintf(stderr, L"[fatal] unhandled exception 0x%08lX at %p -- wrote %s\n",
-                  ep->ExceptionRecord->ExceptionCode, ep->ExceptionRecord->ExceptionAddress, dump_path.c_str());
+    if (wrote) {
+      std::fwprintf(stderr, L"[fatal] unhandled exception 0x%08lX at %p -- wrote %s\n",
+                    ep->ExceptionRecord->ExceptionCode, ep->ExceptionRecord->ExceptionAddress, dump_path.c_str());
+    } else {
+      std::fwprintf(stderr,
+                    L"[fatal] unhandled exception 0x%08lX at %p -- MiniDumpWriteDump FAILED (err=%lu), %s is "
+                    L"empty/unusable -- process state was likely too corrupted to dump\n",
+                    ep->ExceptionRecord->ExceptionCode, ep->ExceptionRecord->ExceptionAddress, dump_err,
+                    dump_path.c_str());
+    }
   }
   return EXCEPTION_EXECUTE_HANDLER;  // terminate after dumping
 }
@@ -102,11 +116,18 @@ void write_hang_dump() {
 
   HANDLE file = CreateFileW(dump_path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
   if (file != INVALID_HANDLE_VALUE) {
-    MiniDumpWriteDump(GetCurrentProcess(), GetCurrentProcessId(), file,
-                       static_cast<MINIDUMP_TYPE>(MiniDumpWithFullMemory | MiniDumpWithHandleData | MiniDumpWithThreadInfo),
-                       nullptr, nullptr, nullptr);
+    const BOOL wrote = MiniDumpWriteDump(
+        GetCurrentProcess(), GetCurrentProcessId(), file,
+        static_cast<MINIDUMP_TYPE>(MiniDumpWithFullMemory | MiniDumpWithHandleData | MiniDumpWithThreadInfo),
+        nullptr, nullptr, nullptr);
+    const DWORD dump_err = wrote ? 0 : GetLastError();
     CloseHandle(file);
-    std::fwprintf(stderr, L"[watchdog] wrote %s\n", dump_path.c_str());
+    if (wrote) {
+      std::fwprintf(stderr, L"[watchdog] wrote %s\n", dump_path.c_str());
+    } else {
+      std::fwprintf(stderr, L"[watchdog] MiniDumpWriteDump FAILED (err=%lu), %s is empty/unusable\n", dump_err,
+                    dump_path.c_str());
+    }
   }
 }
 
