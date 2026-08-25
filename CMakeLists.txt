@@ -149,6 +149,12 @@ target_link_libraries(seven_jit PUBLIC seven_core asmjit::asmjit)
 if(MSVC)
   target_compile_options(seven_jit PRIVATE /WX-)
 endif()
+if(WIN32)
+  # RtlAddGrowableFunctionTable/RtlGrowFunctionTable/RtlDeleteGrowableFunctionTable
+  # (block_compiler.cpp's UnwindAwareJitRuntime) resolve against ntdll, not a
+  # normal SDK import lib.
+  target_link_libraries(seven_jit PUBLIC ntdll)
+endif()
 
 # -------------------------------------------------------------------- unicorn
 # Built from sogen's own vendored submodule/commit so the "unicorn" lane
