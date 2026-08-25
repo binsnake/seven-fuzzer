@@ -15,13 +15,21 @@
 // parallelizing it worthwhile.
 //
 // Usage: seven_fuzzer.exe [iterations] [seed] [--no-hw] [--jit] [--threads N] [--verbose-from N]
-//                          [--watchdog-seconds N]
+//                          [--watchdog-seconds N] [--sweep-seeds N]
 //
 // --jit runs the "seven" side through seven-jit's JitExecutor instead of seven_core's plain
 // interpreter (see lanes/seven_jit_lane.hpp) -- everything else about the run (TestCase generation,
 // the Unicorn/hardware oracles, the comparator, reporting) is unchanged. This is a single check on
 // which engine is under test, not a fourth parallel lane: run once with --jit, once without, to
 // verify both independently against the exact same two oracles.
+//
+// --sweep-seeds N: instead of one run, relaunches this same exe as N fresh CHILD PROCESSES, one per
+// derived seed, each with the other flags passed through unchanged (see run_seed_sweep). A fresh
+// process per seed matters specifically for --jit: that lane can crash or hang from what looks like
+// shared-heap corruption (see the project notes), and a corrupted heap doesn't reset between
+// iterations within one process the way a fresh child does. This is how to get real fuzzing coverage
+// out of --jit today despite that -- a single long --jit run on one seed will very likely die within
+// its first few hundred iterations and never get anywhere near real depth.
 
 // NOMINMAX: seven_jit/jit_executor.hpp transitively pulls in seven_core's float80.hpp, which
 // defines std::numeric_limits<Float80>::min()/max() -- windows.h's own min/max macros silently
@@ -37,6 +45,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <eh.h>
+#include <filesystem>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -451,6 +460,120 @@ void run_worker(int worker_id, std::uint64_t iterations, std::uint64_t seed, boo
   heartbeat.finished.store(true, std::memory_order_relaxed);
 }
 
+// Runs `sweep_seeds` fresh CHILD PROCESSES of this same exe, one per derived seed, moving each
+// child's findings/outliers/dumps into a per-seed subdirectory before the next child starts (each
+// process invocation resets its own finding-index counters, so without this a later child would
+// clobber an earlier one's output). A crash, hang, or watchdog-kill on one seed just moves on to the
+// next -- this is the whole point: --jit's known shared-heap-corruption crash/hang (see the project
+// notes) doesn't reset within one process, so a single long run dies almost immediately and never
+// gets real depth, while a fresh process per seed sidesteps that entirely and still gets full
+// coverage over many seeds. Same shape as the throwaway sweep script used to first measure this
+// tonight, now a permanent, supported feature instead of an ad hoc tool.
+int run_seed_sweep(std::uint64_t base_seed, std::uint64_t iterations_per_seed, unsigned int sweep_seeds,
+                    bool use_hw, bool use_jit, unsigned int watchdog_seconds, unsigned int threads,
+                    bool threads_explicit) {
+  namespace fs = std::filesystem;
+
+  wchar_t exe_path_buf[MAX_PATH];
+  const DWORD exe_path_len = GetModuleFileNameW(nullptr, exe_path_buf, MAX_PATH);
+  const std::wstring exe_path(exe_path_buf, exe_path_len);
+  const fs::path exe_dir_path = fs::path(exe_path).parent_path();
+  const fs::path sweep_dir = exe_dir_path / "sweep_results";
+  fs::create_directories(sweep_dir);
+
+  std::printf(
+      "seven-fuzzer: sweeping %u seeds x %llu iterations each (derived from base seed 0x%llX), engine=%s "
+      "hw=%s watchdog=%us -- results under %ls\n",
+      sweep_seeds, static_cast<unsigned long long>(iterations_per_seed), static_cast<unsigned long long>(base_seed),
+      use_jit ? "seven-jit" : "seven", use_hw ? "on" : "off", watchdog_seconds, sweep_dir.c_str());
+  std::fflush(stdout);
+
+  unsigned int clean = 0, crashed = 0, watchdog_killed = 0, supervisor_killed = 0;
+  const DWORD supervisor_timeout_ms =
+      (watchdog_seconds + 60) * 1000 + static_cast<DWORD>(std::min<std::uint64_t>(iterations_per_seed, 600000));
+
+  for (unsigned int i = 0; i < sweep_seeds; ++i) {
+    const std::uint64_t child_seed = mix_seed(base_seed, static_cast<int>(i));
+    wchar_t seed_hex[32];
+    swprintf(seed_hex, 32, L"0x%llX", static_cast<unsigned long long>(child_seed));
+
+    std::wstring cmdline = L"\"" + exe_path + L"\" " + std::to_wstring(iterations_per_seed) + L" " + seed_hex;
+    if (!use_hw) cmdline += L" --no-hw";
+    if (use_jit) cmdline += L" --jit";
+    cmdline += L" --watchdog-seconds " + std::to_wstring(watchdog_seconds);
+    if (threads_explicit) cmdline += L" --threads " + std::to_wstring(threads);
+
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi{};
+    const BOOL created = CreateProcessW(exe_path.c_str(), cmdline.data(), nullptr, nullptr, FALSE, 0, nullptr,
+                                        exe_dir_path.wstring().c_str(), &si, &pi);
+    if (!created) {
+      std::printf("[sweep %u/%u] seed=0x%llX FAILED TO LAUNCH (err=%lu)\n", i + 1, sweep_seeds,
+                  static_cast<unsigned long long>(child_seed), GetLastError());
+      std::fflush(stdout);
+      continue;
+    }
+
+    const DWORD wait_result = WaitForSingleObject(pi.hProcess, supervisor_timeout_ms);
+    const char* status;
+    if (wait_result == WAIT_TIMEOUT) {
+      // The child's own watchdog should always catch this first -- reaching this means even that
+      // didn't fire, which itself would be worth investigating, not just a normal outcome to expect.
+      TerminateProcess(pi.hProcess, 3);
+      status = "SUPERVISOR TIMEOUT (child's own watchdog never fired)";
+      ++supervisor_killed;
+    } else {
+      DWORD exit_code = 0;
+      GetExitCodeProcess(pi.hProcess, &exit_code);
+      if (exit_code == 2) {
+        status = "watchdog-killed";
+        ++watchdog_killed;
+      } else if (exit_code != 0) {
+        status = "crashed";
+        ++crashed;
+      } else {
+        status = "clean";
+        ++clean;
+      }
+    }
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+
+    // Move this child's output aside before the next child starts and resets the counters findings/
+    // unicorn_outliers are numbered from.
+    const std::wstring seed_tag = seed_hex;
+    for (const auto& [src_name, dst_prefix] :
+        {std::pair<const wchar_t*, const wchar_t*>{L"findings", L"findings_"},
+         std::pair<const wchar_t*, const wchar_t*>{L"unicorn_outliers", L"outliers_"}}) {
+      const fs::path src = exe_dir_path / src_name;
+      if (fs::exists(src) && !fs::is_empty(src)) {
+        fs::rename(src, sweep_dir / (dst_prefix + seed_tag));
+      } else {
+        std::error_code ec;
+        fs::remove_all(src, ec);
+      }
+    }
+    for (const wchar_t* dmp_name : {L"crash.dmp", L"watchdog_hang.dmp"}) {
+      const fs::path src = exe_dir_path / dmp_name;
+      if (fs::exists(src)) {
+        const std::wstring stem = fs::path(dmp_name).stem().wstring();
+        fs::rename(src, sweep_dir / (stem + L"_" + seed_tag + L".dmp"));
+      }
+    }
+
+    std::printf("[sweep %u/%u] seed=0x%llX %s\n", i + 1, sweep_seeds, static_cast<unsigned long long>(child_seed),
+                status);
+    std::fflush(stdout);
+  }
+
+  std::printf(
+      "sweep done: %u seeds -- clean=%u crashed=%u watchdog_killed=%u supervisor_killed=%u -- results under "
+      "%ls\n",
+      sweep_seeds, clean, crashed, watchdog_killed, supervisor_killed, sweep_dir.c_str());
+  return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -461,7 +584,9 @@ int main(int argc, char** argv) {
   bool use_jit = false;
   std::uint64_t verbose_from = UINT64_MAX;
   unsigned int threads = 0;  // 0 = auto
+  bool threads_explicit = false;
   unsigned int watchdog_seconds = 60;  // 0 disables; see run_watchdog
+  unsigned int sweep_seeds = 0;  // 0 = normal single run; see run_seed_sweep
 
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
@@ -469,6 +594,8 @@ int main(int argc, char** argv) {
       use_hw = false;
     } else if (a == "--watchdog-seconds" && i + 1 < argc) {
       watchdog_seconds = static_cast<unsigned int>(std::strtoul(argv[++i], nullptr, 10));
+    } else if (a == "--sweep-seeds" && i + 1 < argc) {
+      sweep_seeds = static_cast<unsigned int>(std::strtoul(argv[++i], nullptr, 10));
     } else if (a == "--jit") {
       // Runs the "seven" side of every comparison through seven-jit's JitExecutor instead of
       // seven_core's plain interpreter -- same TestCase, same Unicorn/hardware oracles, just a
@@ -483,11 +610,17 @@ int main(int argc, char** argv) {
       verbose_from = std::strtoull(argv[++i], nullptr, 10);
     } else if (a == "--threads" && i + 1 < argc) {
       threads = static_cast<unsigned int>(std::strtoul(argv[++i], nullptr, 10));
+      threads_explicit = true;
     } else if (i == 1) {
       iterations = std::strtoull(a.c_str(), nullptr, 10);
     } else if (i == 2) {
       seed = std::strtoull(a.c_str(), nullptr, 0);
     }
+  }
+
+  if (sweep_seeds > 0) {
+    return run_seed_sweep(seed, iterations, sweep_seeds, use_hw, use_jit, watchdog_seconds, threads,
+                          threads_explicit);
   }
 
   if (argc > 1 && std::string(argv[1]) == "--probe-bsr-zero") {
