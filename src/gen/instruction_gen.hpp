@@ -29,8 +29,16 @@ class InstructionGenerator {
 
   [[nodiscard]] TestCase next();
 
+  // How many candidate instructions next() built and then threw away because the encoder refused
+  // them. This used to be invisible: next() catches everything and retries up to 200 times, which
+  // silently hid a bug where almost every immediate form was rejected and whole families of codes
+  // were never emitted at all. A non-trivial rate here means the generator is not covering what
+  // its tables say it covers.
+  [[nodiscard]] std::uint64_t discarded_attempts() const noexcept { return discarded_; }
+
  private:
   std::mt19937_64 rng_;
+  std::uint64_t discarded_ = 0;
 };
 
 }  // namespace sf

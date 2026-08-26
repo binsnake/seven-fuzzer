@@ -228,6 +228,11 @@ struct SharedCounters {
   std::atomic<int> unicorn_outlier_saved{0};  // index counter for the saved-outlier files, separate from the count below
   std::atomic<std::uint64_t> unicorn_outlier_count{0};
   std::atomic<std::uint64_t> hw_harness_errors{0};
+  // Candidates the generator built and then threw away because the encoder refused them. Worth
+  // surfacing: next() just retries until something encodes, so a family whose instructions are all
+  // being rejected looks exactly like one that is working. That hid a bug where nearly every
+  // immediate form was rejected and those codes never reached any lane at all.
+  std::atomic<std::uint64_t> generator_discards{0};
   std::atomic<std::uint64_t> total_done{0};
   std::mutex io_mutex;
   // Bisection (seven-alone and unicorn-alone each survive sustained heavy
@@ -457,6 +462,7 @@ void run_worker(int worker_id, std::uint64_t iterations, std::uint64_t seed, boo
       return;
     }
   }
+  counters.generator_discards.fetch_add(gen.discarded_attempts(), std::memory_order_relaxed);
   heartbeat.finished.store(true, std::memory_order_relaxed);
 }
 
@@ -760,8 +766,9 @@ int main(int argc, char** argv) {
   for (auto& t : pool) t.join();
   watchdog_thread.join();
 
-  std::printf("done. findings=%d unicorn_only_outliers=%llu hw_harness_errors=%llu\n",
+  std::printf("done. findings=%d unicorn_only_outliers=%llu hw_harness_errors=%llu generator_discards=%llu\n",
               counters.finding_count.load(), static_cast<unsigned long long>(counters.unicorn_outlier_count.load()),
-              static_cast<unsigned long long>(counters.hw_harness_errors.load()));
+              static_cast<unsigned long long>(counters.hw_harness_errors.load()),
+              static_cast<unsigned long long>(counters.generator_discards.load()));
   return 0;
 }

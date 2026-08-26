@@ -12,6 +12,7 @@
 #include <iced_x86/instruction.hpp>
 #include <iced_x86/instruction_create.hpp>
 #include <iced_x86/memory_operand.hpp>
+#include <iced_x86/op_kind.hpp>
 #include <iced_x86/register.hpp>
 
 namespace sf {
@@ -23,6 +24,7 @@ using iced_x86::Encoder;
 using iced_x86::Instruction;
 using iced_x86::InstructionFactory;
 using iced_x86::MemoryOperand;
+using iced_x86::OpKind;
 using iced_x86::Register;
 
 enum class Width : int { W8 = 0, W16 = 1, W32 = 2, W64 = 3 };
@@ -142,6 +144,67 @@ struct Ctx {
 }
 [[nodiscard]] int widx16_32_64(Width w) { return w == Width::W16 ? 0 : w == Width::W32 ? 1 : 2; }
 
+// InstructionFactory's integer overloads always build the immediate as OpKind::IMMEDIATE32, and
+// the encoder refuses anything but the exact kind the opcode wants ("Expected OpKind N, actual
+// OpKind 9"). next()'s catch-and-retry swallowed those failures, so every family below looked
+// like it was covering its immediate forms while actually only ever emitting the one code that
+// genuinely takes an imm32. Stamping the right kind is what makes the rest reachable: the
+// sign-extended imm8 ALU forms, every 8/16/64-bit immediate, and all the shift-by-imm8 codes.
+void set_imm_kind(Instruction& instr, std::uint32_t index, OpKind kind) {
+  switch (index) {
+    case 0: instr.set_op0_kind(kind); break;
+    case 1: instr.set_op1_kind(kind); break;
+    default: instr.set_op2_kind(kind); break;
+  }
+}
+
+// A plain 8-bit immediate that is not widened: shift counts, bit offsets, SIMD selectors.
+void set_imm8(Instruction& instr, std::uint32_t index, std::uint64_t value) {
+  set_imm_kind(instr, index, OpKind::IMMEDIATE8);
+  instr.set_immediate8(static_cast<std::uint8_t>(value));
+}
+
+// An immediate that is part of an operand-sized form. `sign_extended_imm8` selects the short
+// encoding (the 83 /r family and its relatives), which the operand width then widens.
+void set_imm_sized(Instruction& instr, std::uint32_t index, Width w, bool sign_extended_imm8,
+                   std::uint64_t value) {
+  if (sign_extended_imm8) {
+    const auto byte = static_cast<std::int8_t>(value);
+    switch (w) {
+      case Width::W16:
+        set_imm_kind(instr, index, OpKind::IMMEDIATE8TO16);
+        instr.set_immediate8to16(static_cast<std::int16_t>(byte));
+        return;
+      case Width::W32:
+        set_imm_kind(instr, index, OpKind::IMMEDIATE8TO32);
+        instr.set_immediate8to32(static_cast<std::int32_t>(byte));
+        return;
+      default:
+        set_imm_kind(instr, index, OpKind::IMMEDIATE8TO64);
+        instr.set_immediate8to64(static_cast<std::int64_t>(byte));
+        return;
+    }
+  }
+  switch (w) {
+    case Width::W8:
+      set_imm_kind(instr, index, OpKind::IMMEDIATE8);
+      instr.set_immediate8(static_cast<std::uint8_t>(value));
+      return;
+    case Width::W16:
+      set_imm_kind(instr, index, OpKind::IMMEDIATE16);
+      instr.set_immediate16(static_cast<std::uint16_t>(value));
+      return;
+    case Width::W32:
+      set_imm_kind(instr, index, OpKind::IMMEDIATE32);
+      instr.set_immediate32(static_cast<std::uint32_t>(value));
+      return;
+    default:
+      set_imm_kind(instr, index, OpKind::IMMEDIATE32TO64);
+      instr.set_immediate32to64(static_cast<std::int64_t>(static_cast<std::int32_t>(value)));
+      return;
+  }
+}
+
 // ---------------------------------------------------------------- ALU/TEST
 
 struct AluCodes {
@@ -182,7 +245,9 @@ const std::array<AluCodes, 8> kAluOps = {
     const std::int32_t imm = short_imm
         ? static_cast<std::int32_t>(static_cast<std::int8_t>(random_imm(c.rng, 8)))
         : static_cast<std::int32_t>(random_imm(c.rng, w == Width::W8 ? 8 : w == Width::W16 ? 16 : 32));
-    return InstructionFactory::with2(code, reg_of(w, a), imm);
+    auto instr = InstructionFactory::with2(code, reg_of(w, a), imm);
+    set_imm_sized(instr, 1, w, short_imm, static_cast<std::uint64_t>(imm));
+    return instr;
   }
 
   c.touches_memory = true;
@@ -193,7 +258,9 @@ const std::array<AluCodes, 8> kAluOps = {
     const std::int32_t imm = short_imm
         ? static_cast<std::int32_t>(static_cast<std::int8_t>(random_imm(c.rng, 8)))
         : static_cast<std::int32_t>(random_imm(c.rng, w == Width::W8 ? 8 : w == Width::W16 ? 16 : 32));
-    return InstructionFactory::with2(code, mem_operand(disp), imm);
+    auto instr = InstructionFactory::with2(code, mem_operand(disp), imm);
+    set_imm_sized(instr, 1, w, short_imm, static_cast<std::uint64_t>(imm));
+    return instr;
   }
   const int r = pick_reg_index(c.rng);
   if (rand_int(c.rng, 0, 1) == 0) {
@@ -224,7 +291,9 @@ const TestCodes kTest = {
   if (form == 1) {
     const int a = pick_reg_index(c.rng);
     const std::int32_t imm = static_cast<std::int32_t>(random_imm(c.rng, imm_bits));
-    return InstructionFactory::with2(kTest.rm_imm[static_cast<std::size_t>(wi)], reg_of(w, a), imm);
+    auto instr = InstructionFactory::with2(kTest.rm_imm[static_cast<std::size_t>(wi)], reg_of(w, a), imm);
+    set_imm_sized(instr, 1, w, false, static_cast<std::uint64_t>(imm));
+    return instr;
   }
   c.touches_memory = true;
   const std::int8_t disp = random_disp8(c.rng);
@@ -233,7 +302,9 @@ const TestCodes kTest = {
     return InstructionFactory::with2(kTest.rm_r[static_cast<std::size_t>(wi)], mem_operand(disp), reg_of(w, b));
   }
   const std::int32_t imm = static_cast<std::int32_t>(random_imm(c.rng, imm_bits));
-  return InstructionFactory::with2(kTest.rm_imm[static_cast<std::size_t>(wi)], mem_operand(disp), imm);
+  auto test_mem = InstructionFactory::with2(kTest.rm_imm[static_cast<std::size_t>(wi)], mem_operand(disp), imm);
+  set_imm_sized(test_mem, 1, w, false, static_cast<std::uint64_t>(imm));
+  return test_mem;
 }
 
 // ------------------------------------------------------------- INC/DEC/etc
@@ -289,13 +360,17 @@ const std::array<ShiftCodes, 7> kShiftOps = {
     if (use_cl) return InstructionFactory::with2(t.cl[static_cast<std::size_t>(wi)], reg_of(w, a), Register::CL);
     std::int32_t imm = static_cast<std::int32_t>(random_imm(c.rng, 8));
     if (rand_int(c.rng, 0, 4) != 0) imm &= 0x3F;  // usually in-range; sometimes probe masking of the high bits
-    return InstructionFactory::with2(t.imm8[static_cast<std::size_t>(wi)], reg_of(w, a), imm);
+    auto instr = InstructionFactory::with2(t.imm8[static_cast<std::size_t>(wi)], reg_of(w, a), imm);
+    set_imm8(instr, 1, static_cast<std::uint64_t>(imm));
+    return instr;
   }
   c.touches_memory = true;
   const std::int8_t disp = random_disp8(c.rng);
   if (use_cl) return InstructionFactory::with2(t.cl[static_cast<std::size_t>(wi)], mem_operand(disp), Register::CL);
   const std::int32_t imm = static_cast<std::int32_t>(random_imm(c.rng, 8));
-  return InstructionFactory::with2(t.imm8[static_cast<std::size_t>(wi)], mem_operand(disp), imm);
+  auto shift_mem = InstructionFactory::with2(t.imm8[static_cast<std::size_t>(wi)], mem_operand(disp), imm);
+  set_imm8(shift_mem, 1, static_cast<std::uint64_t>(imm));
+  return shift_mem;
 }
 
 // -------------------------------------------------------------------- MOV
@@ -329,7 +404,9 @@ const MovCodes kMov = {
     const int bits = bits_of(w);
     const std::int32_t imm = static_cast<std::int32_t>(random_imm(c.rng, bits));
     const Code code = w == Width::W8 ? Code::MOV_R8_IMM8 : w == Width::W16 ? Code::MOV_R16_IMM16 : Code::MOV_R32_IMM32;
-    return InstructionFactory::with2(code, reg_of(w, a), imm);
+    auto instr = InstructionFactory::with2(code, reg_of(w, a), imm);
+    set_imm_sized(instr, 1, w, false, static_cast<std::uint64_t>(imm));
+    return instr;
   }
 
   c.touches_memory = true;
@@ -344,7 +421,9 @@ const MovCodes kMov = {
     return InstructionFactory::with2(kMov.r_rm[static_cast<std::size_t>(wi)], reg_of(w, r), mem_operand(disp));
   }
   const std::int32_t imm = static_cast<std::int32_t>(random_imm(c.rng, w == Width::W8 ? 8 : w == Width::W16 ? 16 : 32));
-  return InstructionFactory::with2(kMov.rm_imm[static_cast<std::size_t>(wi)], mem_operand(disp), imm);
+  auto mov_mem = InstructionFactory::with2(kMov.rm_imm[static_cast<std::size_t>(wi)], mem_operand(disp), imm);
+  set_imm_sized(mov_mem, 1, w, false, static_cast<std::uint64_t>(imm));
+  return mov_mem;
 }
 
 // --------------------------------------------------------- MOVZX/MOVSX(D)
@@ -513,7 +592,9 @@ const std::array<const BtCodes*, 4> kBtFamily = {&kBt, &kBts, &kBtr, &kBtc};
     const int a = pick_reg_index(c.rng);
     if (use_imm) {
       const std::int32_t imm = static_cast<std::int32_t>(random_imm(c.rng, 8));
-      return InstructionFactory::with2(t.rm_imm[wi], reg_of(w, a), imm);
+      auto instr = InstructionFactory::with2(t.rm_imm[wi], reg_of(w, a), imm);
+      set_imm8(instr, 1, static_cast<std::uint64_t>(imm));
+      return instr;
     }
     const int b = pick_reg_index(c.rng);
     return InstructionFactory::with2(t.rm_r[wi], reg_of(w, a), reg_of(w, b));
@@ -522,7 +603,9 @@ const std::array<const BtCodes*, 4> kBtFamily = {&kBt, &kBts, &kBtr, &kBtc};
   const std::int8_t disp = random_disp8(c.rng);
   if (use_imm) {
     const std::int32_t imm = static_cast<std::int32_t>(random_imm(c.rng, 8));
-    return InstructionFactory::with2(t.rm_imm[wi], mem_operand(disp), imm);
+    auto instr = InstructionFactory::with2(t.rm_imm[wi], mem_operand(disp), imm);
+    set_imm8(instr, 1, static_cast<std::uint64_t>(imm));
+    return instr;
   }
   const int b = pick_reg_index(c.rng);
   return InstructionFactory::with2(t.rm_r[wi], mem_operand(disp), reg_of(w, b));
@@ -673,10 +756,14 @@ const Imul3Codes kImul3 = {
   const Code code = short_imm ? kImul3.imm8[wi] : kImul3.immfull[wi];
   if (rand_int(c.rng, 0, 1) == 0) {
     const int s = pick_reg_index(c.rng);
-    return InstructionFactory::with3(code, reg_of(w, d), reg_of(w, s), imm);
+    auto instr = InstructionFactory::with3(code, reg_of(w, d), reg_of(w, s), imm);
+    set_imm_sized(instr, 2, w, short_imm, static_cast<std::uint64_t>(imm));
+    return instr;
   }
   c.touches_memory = true;
-  return InstructionFactory::with3(code, reg_of(w, d), mem_operand(random_disp8(c.rng)), imm);
+  auto imul_mem = InstructionFactory::with3(code, reg_of(w, d), mem_operand(random_disp8(c.rng)), imm);
+  set_imm_sized(imul_mem, 2, w, short_imm, static_cast<std::uint64_t>(imm));
+  return imul_mem;
 }
 
 // ------------------------------------------------------------- SIMD (XMM)
@@ -727,10 +814,14 @@ constexpr std::array<Code, 7> kSimdShuffleNoImm = {
     const auto imm = static_cast<std::int32_t>(random_imm(c.rng, 8));
     if (use_mem) {
       c.touches_memory = true;
-      return InstructionFactory::with3(code, xmm_of(d), mem_operand(random_disp8(c.rng)), imm);
+      auto instr = InstructionFactory::with3(code, xmm_of(d), mem_operand(random_disp8(c.rng)), imm);
+      set_imm8(instr, 2, static_cast<std::uint64_t>(imm));
+      return instr;
     }
     const int s = pick_xmm_index(c.rng);
-    return InstructionFactory::with3(code, xmm_of(d), xmm_of(s), imm);
+    auto instr = InstructionFactory::with3(code, xmm_of(d), xmm_of(s), imm);
+    set_imm8(instr, 2, static_cast<std::uint64_t>(imm));
+    return instr;
   }
   const Code code =
       kSimdShuffleNoImm[static_cast<std::size_t>(rand_int(c.rng, 0, static_cast<int>(kSimdShuffleNoImm.size()) - 1))];
@@ -796,7 +887,9 @@ constexpr std::array<Code, 10> kSimdShiftImm = {
     const Code code =
         kSimdShiftImm[static_cast<std::size_t>(rand_int(c.rng, 0, static_cast<int>(kSimdShiftImm.size()) - 1))];
     const auto imm = static_cast<std::int32_t>(random_imm(c.rng, 8));
-    return InstructionFactory::with2(code, xmm_of(d), imm);
+    auto instr = InstructionFactory::with2(code, xmm_of(d), imm);
+    set_imm8(instr, 1, static_cast<std::uint64_t>(imm));
+    return instr;
   }
   const Code code =
       kSimdShiftReg[static_cast<std::size_t>(rand_int(c.rng, 0, static_cast<int>(kSimdShiftReg.size()) - 1))];
@@ -921,13 +1014,13 @@ TestCase InstructionGenerator::next() {
       Ctx c{rng_, false};
       const GenFn fn = kFamilies[static_cast<std::size_t>(rand_int(rng_, 0, static_cast<int>(kFamilies.size()) - 1))];
       const std::optional<Instruction> instr = fn(c);
-      if (!instr.has_value()) continue;
+      if (!instr.has_value()) { ++discarded_; continue; }
 
       Encoder enc(64);
       const auto res = enc.encode(*instr, kCodeBase);
-      if (!res) continue;
+      if (!res) { ++discarded_; continue; }
       std::vector<std::uint8_t> bytes = enc.take_buffer();
-      if (bytes.empty()) continue;
+      if (bytes.empty()) { ++discarded_; continue; }
 
       TestCase tc;
       tc.bytes = bytes;
@@ -984,6 +1077,7 @@ TestCase InstructionGenerator::next() {
 
       return tc;
     } catch (...) {
+      ++discarded_;
       continue;
     }
   }
