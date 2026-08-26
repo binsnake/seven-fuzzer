@@ -1219,6 +1219,36 @@ constexpr std::array<Code, 4> kSimdFpCompare = {
     Code::COMISS_XMM_XMMM32, Code::UCOMISS_XMM_XMMM32, Code::COMISD_XMM_XMMM64, Code::UCOMISD_XMM_XMMM64,
 };
 
+// The SSE/SSE2 float workhorses. Every one of these twenty-eight is a real-code hot path and not one
+// had ever been generated, even though all three lanes already compare XMM state in full. MIN/MAX
+// are the interesting pair: their NaN and signed-zero behaviour is asymmetric by design (the second
+// operand wins whenever either input is a NaN, and -0.0 vs +0.0 is decided by the operand order, not
+// by value), which an implementation written the obvious way gets wrong.
+//
+// RCP*/RSQRT* are deliberately absent: hardware only promises those to within a relative error
+// bound, so no soft-float implementation can match them bit for bit and every case would report.
+constexpr std::array<Code, 28> kSseArith = {
+    Code::ADDPS_XMM_XMMM128,  Code::ADDPD_XMM_XMMM128,  Code::ADDSS_XMM_XMMM32,  Code::ADDSD_XMM_XMMM64,
+    Code::SUBPS_XMM_XMMM128,  Code::SUBPD_XMM_XMMM128,  Code::SUBSS_XMM_XMMM32,  Code::SUBSD_XMM_XMMM64,
+    Code::MULPS_XMM_XMMM128,  Code::MULPD_XMM_XMMM128,  Code::MULSS_XMM_XMMM32,  Code::MULSD_XMM_XMMM64,
+    Code::DIVPS_XMM_XMMM128,  Code::DIVPD_XMM_XMMM128,  Code::DIVSS_XMM_XMMM32,  Code::DIVSD_XMM_XMMM64,
+    Code::MINPS_XMM_XMMM128,  Code::MINPD_XMM_XMMM128,  Code::MINSS_XMM_XMMM32,  Code::MINSD_XMM_XMMM64,
+    Code::MAXPS_XMM_XMMM128,  Code::MAXPD_XMM_XMMM128,  Code::MAXSS_XMM_XMMM32,  Code::MAXSD_XMM_XMMM64,
+    Code::SQRTPS_XMM_XMMM128, Code::SQRTPD_XMM_XMMM128, Code::SQRTSS_XMM_XMMM32, Code::SQRTSD_XMM_XMMM64,
+};
+
+[[nodiscard]] std::optional<Instruction> gen_sse_arith(Ctx& c) {
+  c.flags_mask = 0;  // none of these touch EFLAGS
+  const Code code = kSseArith[static_cast<std::size_t>(rand_int(c.rng, 0, static_cast<int>(kSseArith.size()) - 1))];
+  const int d = pick_xmm_index(c.rng);
+  if (rand_int(c.rng, 0, 3) == 0) {
+    c.touches_memory = true;
+    return InstructionFactory::with2(code, xmm_of(d), mem_operand(random_disp8(c.rng)));
+  }
+  const int s = pick_xmm_index(c.rng);
+  return InstructionFactory::with2(code, xmm_of(d), xmm_of(s));
+}
+
 [[nodiscard]] std::optional<Instruction> gen_simd_fp(Ctx& c) {
   const int d = pick_xmm_index(c.rng);
   const bool is_compare = rand_int(c.rng, 0, 1) == 0;
@@ -1396,7 +1426,7 @@ constexpr std::array<Code, 4> kSimdFpCompare = {
 // -------------------------------------------------------------- dispatch
 
 using GenFn = std::optional<Instruction> (*)(Ctx&);
-constexpr std::array<GenFn, 32> kFamilies = {
+constexpr std::array<GenFn, 33> kFamilies = {
     gen_alu, gen_test, gen_unary, gen_shift, gen_mov, gen_movx, gen_movsxd,
     gen_pushpop, gen_lea, gen_jcc, gen_jmp, gen_call, gen_ret, gen_setcc,
     gen_cmovcc, gen_bt, gen_rmsrc, gen_bswap,
@@ -1404,6 +1434,7 @@ constexpr std::array<GenFn, 32> kFamilies = {
     gen_string_ops,
     gen_muldiv, gen_imul_multi,
     gen_simd_shuffle, gen_simd_logic, gen_simd_pack, gen_simd_shift, gen_simd_fp,
+    gen_sse_arith,
     // gen_privileged / gen_privileged_movcrdr: intentionally excluded, see
     // the comment above their definitions.
 };
