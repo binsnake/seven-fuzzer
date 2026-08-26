@@ -316,13 +316,34 @@ const TestCodes kTest = {
     {Code::TEST_RM8_R8, Code::TEST_RM16_R16, Code::TEST_RM32_R32, Code::TEST_RM64_R64},
     {Code::TEST_RM8_IMM8, Code::TEST_RM16_IMM16, Code::TEST_RM32_IMM32, Code::TEST_RM64_IMM32},
 };
+// F6/F7 /1 is a second, undocumented-but-real encoding of TEST r/m, imm that decodes to its own
+// Code. Silicon treats it exactly like /0, which is worth confirming rather than assuming.
+constexpr std::array<Code, 4> kTestImmF7R1 = {Code::TEST_RM8_IMM8_F6R1, Code::TEST_RM16_IMM16_F7R1,
+                                               Code::TEST_RM32_IMM32_F7R1, Code::TEST_RM64_IMM32_F7R1};
+constexpr std::array<Code, 4> kTestAccImm = {Code::TEST_AL_IMM8, Code::TEST_AX_IMM16,
+                                              Code::TEST_EAX_IMM32, Code::TEST_RAX_IMM32};
 
 [[nodiscard]] std::optional<Instruction> gen_test(Ctx& c) {
   const Width w = static_cast<Width>(rand_int(c.rng, 0, 3));
   const int wi = static_cast<int>(w);
   const int imm_bits = w == Width::W8 ? 8 : w == Width::W16 ? 16 : 32;
-  const int form = rand_int(c.rng, 0, 2);
+  const int form = rand_int(c.rng, 0, 3);
 
+  if (form == 3) {
+    const std::int32_t imm = static_cast<std::int32_t>(random_imm(c.rng, imm_bits));
+    const bool accumulator = rand_int(c.rng, 0, 1) == 0;
+    const auto wu = static_cast<std::size_t>(wi);
+    auto instr = accumulator
+        ? InstructionFactory::with2(kTestAccImm[wu],
+                                    w == Width::W8    ? Register::AL
+                                    : w == Width::W16 ? Register::AX
+                                    : w == Width::W32 ? Register::EAX
+                                                      : Register::RAX,
+                                    imm)
+        : InstructionFactory::with2(kTestImmF7R1[wu], reg_of(w, pick_reg_index(c.rng)), imm);
+    set_imm_sized(instr, 1, w, false, static_cast<std::uint64_t>(imm));
+    return instr;
+  }
   if (form == 0) {
     const int a = pick_reg_index(c.rng), b = pick_reg_index(c.rng);
     return InstructionFactory::with2(kTest.rm_r[static_cast<std::size_t>(wi)], reg_of(w, a), reg_of(w, b));
@@ -537,7 +558,87 @@ constexpr std::array<Width, 6> kMovxSrcW = {Width::W8, Width::W8, Width::W8, Wid
 [[nodiscard]] std::optional<Instruction> gen_lea(Ctx& c) {
   c.touches_memory = true;  // address arithmetic references RDI; no actual dereference
   const int d = pick_reg_index(c.rng);
-  return InstructionFactory::with2(Code::LEA_R64_M, reg_of(Width::W64, d), mem_operand(random_disp8(c.rng)));
+  // The destination width truncates the computed address, and each width is its own Code.
+  const Width w = width16_32_64(c.rng);
+  static constexpr std::array<Code, 3> kLea = {Code::LEA_R16_M, Code::LEA_R32_M, Code::LEA_R64_M};
+  return InstructionFactory::with2(kLea[static_cast<std::size_t>(widx16_32_64(w))], reg_of(w, d),
+                                   mem_operand(random_disp8(c.rng)));
+}
+
+// The A0-A3 absolute-address forms. No ModRM and no base register at all -- the address is an
+// 8-byte immediate -- which is why nothing else in the generator produces them, and why the store
+// direction being implemented backwards went unnoticed.
+[[nodiscard]] std::optional<Instruction> gen_moffs(Ctx& c) {
+  c.flags_mask = 0;  // MOV defines no flags
+  c.touches_memory = true;
+  static constexpr std::array<Code, 4> kLoad = {Code::MOV_AL_MOFFS8, Code::MOV_AX_MOFFS16,
+                                                 Code::MOV_EAX_MOFFS32, Code::MOV_RAX_MOFFS64};
+  static constexpr std::array<Code, 4> kStore = {Code::MOV_MOFFS8_AL, Code::MOV_MOFFS16_AX,
+                                                  Code::MOV_MOFFS32_EAX, Code::MOV_MOFFS64_RAX};
+  const Width w = static_cast<Width>(rand_int(c.rng, 0, 3));
+  const auto wu = static_cast<std::size_t>(w);
+  const Register acc = w == Width::W8    ? Register::AL
+                       : w == Width::W16 ? Register::AX
+                       : w == Width::W32 ? Register::EAX
+                                         : Register::RAX;
+  // Keep the whole access inside the compared scratch window.
+  const auto offset = static_cast<std::uint64_t>(rand_int(c.rng, 0, 15)) * 8;
+  const auto addr = MemoryOperand::with_displ(kDataBase + offset, 8);
+  return rand_int(c.rng, 0, 1) == 0 ? InstructionFactory::with2(kLoad[wu], acc, addr)
+                                     : InstructionFactory::with2(kStore[wu], addr, acc);
+}
+
+// MOVBE byte-swaps on the way to or from memory, CRC32 accumulates the SSE4.2 polynomial, and the
+// 0F 1F multi-byte NOP has to genuinely do nothing at every width -- three separate families that
+// only share the fact that none of them had any generator coverage at all.
+[[nodiscard]] std::optional<Instruction> gen_movbe_crc32_nop(Ctx& c) {
+  const int pick = rand_int(c.rng, 0, 2);
+  if (pick == 0) {
+    c.flags_mask = 0;  // MOVBE defines no flags
+    c.touches_memory = true;
+    const Width w = width16_32_64(c.rng);
+    const auto wu = static_cast<std::size_t>(widx16_32_64(w));
+    const int r = pick_reg_index(c.rng);
+    static constexpr std::array<Code, 3> kLoad = {Code::MOVBE_R16_M16, Code::MOVBE_R32_M32,
+                                                   Code::MOVBE_R64_M64};
+    static constexpr std::array<Code, 3> kStore = {Code::MOVBE_M16_R16, Code::MOVBE_M32_R32,
+                                                    Code::MOVBE_M64_R64};
+    const std::int8_t disp = random_disp8(c.rng);
+    return rand_int(c.rng, 0, 1) == 0
+        ? InstructionFactory::with2(kLoad[wu], reg_of(w, r), mem_operand(disp))
+        : InstructionFactory::with2(kStore[wu], mem_operand(disp), reg_of(w, r));
+  }
+  if (pick == 1) {
+    c.flags_mask = 0;  // CRC32 defines no flags
+    const int d = pick_reg_index(c.rng);
+    const int src = pick_reg_index(c.rng);
+    // The destination is always 32- or 64-bit; only the SOURCE width varies.
+    const bool dest64 = rand_int(c.rng, 0, 1) == 0;
+    const Width sw = dest64 ? (rand_int(c.rng, 0, 1) == 0 ? Width::W8 : Width::W64)
+                            : static_cast<Width>(rand_int(c.rng, 0, 2));
+    Code code = Code::CRC32_R32_RM8;
+    if (dest64) {
+      code = sw == Width::W8 ? Code::CRC32_R64_RM8 : Code::CRC32_R64_RM64;
+    } else {
+      code = sw == Width::W8 ? Code::CRC32_R32_RM8 : sw == Width::W16 ? Code::CRC32_R32_RM16
+                                                                      : Code::CRC32_R32_RM32;
+    }
+    const Width dw = dest64 ? Width::W64 : Width::W32;
+    if (rand_int(c.rng, 0, 2) == 0) {
+      c.touches_memory = true;
+      return InstructionFactory::with2(code, reg_of(dw, d), mem_operand(random_disp8(c.rng)));
+    }
+    return InstructionFactory::with2(code, reg_of(dw, d), reg_of(sw, src));
+  }
+  c.flags_mask = 0;
+  const Width w = width16_32_64(c.rng);
+  static constexpr std::array<Code, 3> kNop = {Code::NOP_RM16, Code::NOP_RM32, Code::NOP_RM64};
+  const Code code = kNop[static_cast<std::size_t>(widx16_32_64(w))];
+  if (rand_int(c.rng, 0, 1) == 0) {
+    c.touches_memory = true;
+    return InstructionFactory::with1(code, mem_operand(random_disp8(c.rng)));
+  }
+  return InstructionFactory::with1(code, reg_of(w, pick_reg_index(c.rng)));
 }
 
 // --------------------------------------------------------- branches/Jcc
@@ -1217,11 +1318,11 @@ constexpr std::array<Code, 4> kSimdFpCompare = {
 // -------------------------------------------------------------- dispatch
 
 using GenFn = std::optional<Instruction> (*)(Ctx&);
-constexpr std::array<GenFn, 29> kFamilies = {
+constexpr std::array<GenFn, 31> kFamilies = {
     gen_alu, gen_test, gen_unary, gen_shift, gen_mov, gen_movx, gen_movsxd,
     gen_pushpop, gen_lea, gen_jcc, gen_jmp, gen_call, gen_ret, gen_setcc,
     gen_cmovcc, gen_bt, gen_rmsrc, gen_bswap,
-    gen_loop, gen_xchg, gen_xadd_cmpxchg, gen_shld_shrd,
+    gen_loop, gen_xchg, gen_xadd_cmpxchg, gen_shld_shrd, gen_movbe_crc32_nop, gen_moffs,
     gen_muldiv, gen_imul_multi,
     gen_simd_shuffle, gen_simd_logic, gen_simd_pack, gen_simd_shift, gen_simd_fp,
     // gen_privileged / gen_privileged_movcrdr: intentionally excluded, see
