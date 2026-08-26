@@ -235,6 +235,9 @@ struct AluCodes {
   std::array<Code, 4> r_rm;
   std::array<Code, 4> rm_imm8;
   std::array<Code, 4> rm_immfull;
+  // The one-byte accumulator forms (04 ib, 0C ib, ...). Same semantics as the r/m,imm forms
+  // but a different encoding and a different Code, so they need asking for by name.
+  std::array<Code, 4> acc_imm;
 };
 
 #define SF_ALU(OP)                                                                                     \
@@ -243,6 +246,7 @@ struct AluCodes {
     {Code::OP##_R8_RM8, Code::OP##_R16_RM16, Code::OP##_R32_RM32, Code::OP##_R64_RM64},                 \
     {Code::OP##_RM8_IMM8, Code::OP##_RM16_IMM8, Code::OP##_RM32_IMM8, Code::OP##_RM64_IMM8},             \
     {Code::OP##_RM8_IMM8, Code::OP##_RM16_IMM16, Code::OP##_RM32_IMM32, Code::OP##_RM64_IMM32},          \
+    {Code::OP##_AL_IMM8, Code::OP##_AX_IMM16, Code::OP##_EAX_IMM32, Code::OP##_RAX_IMM32},               \
   }
 
 const std::array<AluCodes, 8> kAluOps = {
@@ -254,7 +258,19 @@ const std::array<AluCodes, 8> kAluOps = {
   const AluCodes& t = kAluOps[static_cast<std::size_t>(rand_int(c.rng, 0, 7))];
   const Width w = static_cast<Width>(rand_int(c.rng, 0, 3));
   const int wi = static_cast<int>(w);
-  const int form = rand_int(c.rng, 0, 2);  // 0=reg,reg  1=reg,imm  2=memory variant
+  const int form = rand_int(c.rng, 0, 3);  // 0=reg,reg  1=reg,imm  2=memory  3=accumulator,imm
+
+  if (form == 3) {
+    const Register acc = w == Width::W8    ? Register::AL
+                         : w == Width::W16 ? Register::AX
+                         : w == Width::W32 ? Register::EAX
+                                           : Register::RAX;
+    const std::int32_t imm =
+        static_cast<std::int32_t>(random_imm(c.rng, w == Width::W8 ? 8 : w == Width::W16 ? 16 : 32));
+    auto instr = InstructionFactory::with2(t.acc_imm[static_cast<std::size_t>(wi)], acc, imm);
+    set_imm_sized(instr, 1, w, false, static_cast<std::uint64_t>(imm));
+    return instr;
+  }
 
   if (form == 0) {
     const int a = pick_reg_index(c.rng);
@@ -355,14 +371,19 @@ const std::array<Unary1Codes, 4> kUnaryOps = {SF_UN(INC), SF_UN(DEC), SF_UN(NEG)
 struct ShiftCodes {
   std::array<Code, 4> imm8;
   std::array<Code, 4> cl;
+  // The D1 /r forms, where the count of 1 is part of the opcode rather than an immediate byte.
+  // They are the only shifts that leave OF architecturally defined.
+  std::array<Code, 4> one;
 };
 #define SF_SH(OP)                                                                                \
   ShiftCodes {                                                                                     \
     {Code::OP##_RM8_IMM8, Code::OP##_RM16_IMM8, Code::OP##_RM32_IMM8, Code::OP##_RM64_IMM8},        \
     {Code::OP##_RM8_CL, Code::OP##_RM16_CL, Code::OP##_RM32_CL, Code::OP##_RM64_CL},                \
+    {Code::OP##_RM8_1, Code::OP##_RM16_1, Code::OP##_RM32_1, Code::OP##_RM64_1},                    \
   }
-const std::array<ShiftCodes, 7> kShiftOps = {
-    SF_SH(SHL), SF_SH(SHR), SF_SH(SAR), SF_SH(ROL), SF_SH(ROR), SF_SH(RCL), SF_SH(RCR),
+// SAL is the /4 alias of SHL and decodes to its own Code, so it needs its own entry to be reached.
+const std::array<ShiftCodes, 8> kShiftOps = {
+    SF_SH(SHL), SF_SH(SHR), SF_SH(SAR), SF_SH(ROL), SF_SH(ROR), SF_SH(RCL), SF_SH(RCR), SF_SH(SAL),
 };
 #undef SF_SH
 
@@ -371,15 +392,26 @@ const std::array<ShiftCodes, 7> kShiftOps = {
   // multi-bit counts it's undefined, so don't compare it (the actual count
   // isn't known until CL's randomized value is picked, so this excludes OF
   // unconditionally rather than trying to predict count==1).
-  c.flags_mask &= ~0x0800ull;
-  const ShiftCodes& t = kShiftOps[static_cast<std::size_t>(rand_int(c.rng, 0, 6))];
+  const ShiftCodes& t = kShiftOps[static_cast<std::size_t>(rand_int(c.rng, 0, 7))];
   const Width w = static_cast<Width>(rand_int(c.rng, 0, 3));
   const int wi = static_cast<int>(w);
-  const bool use_cl = rand_int(c.rng, 0, 1) == 0;
+  const int count_form = rand_int(c.rng, 0, 2);  // 0=imm8  1=CL  2=the shift-by-one opcode
+  const bool use_one = count_form == 2;
+  const bool use_cl = count_form == 1;
   const bool use_mem = rand_int(c.rng, 0, 3) == 0;
+  // OF is only defined for a single-bit shift or rotate; for a multi-bit count it is undefined,
+  // and CL's value isn't known until it is randomized, so it can only be compared on the
+  // shift-by-one form.
+  if (!use_one) c.flags_mask &= ~0x0800ull;
 
   if (!use_mem) {
     const int a = pick_reg_index(c.rng);
+    if (use_one) {
+      // iced still models the count as a second operand for these, it just has to be exactly 1.
+      auto one = InstructionFactory::with2(t.one[static_cast<std::size_t>(wi)], reg_of(w, a), 1);
+      set_imm8(one, 1, 1);
+      return one;
+    }
     if (use_cl) return InstructionFactory::with2(t.cl[static_cast<std::size_t>(wi)], reg_of(w, a), Register::CL);
     std::int32_t imm = static_cast<std::int32_t>(random_imm(c.rng, 8));
     if (rand_int(c.rng, 0, 4) != 0) imm &= 0x3F;  // usually in-range; sometimes probe masking of the high bits
@@ -389,6 +421,11 @@ const std::array<ShiftCodes, 7> kShiftOps = {
   }
   c.touches_memory = true;
   const std::int8_t disp = random_disp8(c.rng);
+  if (use_one) {
+    auto one_mem = InstructionFactory::with2(t.one[static_cast<std::size_t>(wi)], mem_operand(disp), 1);
+    set_imm8(one_mem, 1, 1);
+    return one_mem;
+  }
   if (use_cl) return InstructionFactory::with2(t.cl[static_cast<std::size_t>(wi)], mem_operand(disp), Register::CL);
   const std::int32_t imm = static_cast<std::int32_t>(random_imm(c.rng, 8));
   auto shift_mem = InstructionFactory::with2(t.imm8[static_cast<std::size_t>(wi)], mem_operand(disp), imm);
