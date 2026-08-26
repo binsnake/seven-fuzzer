@@ -141,6 +141,15 @@ struct Ctx {
   return static_cast<std::int8_t>(rand_int(rng, 0, 0x7F));
 }
 
+// Same window and sign constraints as random_disp8, snapped down to a multiple of `alignment`.
+// kDataBase is page-aligned, so an aligned displacement gives an aligned effective address -- which
+// is what the legacy SIMD m128 forms need to get past their #GP check and actually exercise the
+// operation rather than the check.
+[[nodiscard]] std::int8_t aligned_disp8(std::mt19937_64& rng, int alignment) {
+  const int raw = rand_int(rng, 0, 0x7F);
+  return static_cast<std::int8_t>(raw - (raw % alignment));
+}
+
 [[nodiscard]] int pick_reg_index(std::mt19937_64& rng) { return rand_int(rng, 0, 15); }
 
 [[nodiscard]] MemoryOperand mem_operand(std::int8_t disp) {
@@ -1237,6 +1246,103 @@ constexpr std::array<Code, 28> kSseArith = {
     Code::SQRTPS_XMM_XMMM128, Code::SQRTPD_XMM_XMMM128, Code::SQRTSS_XMM_XMMM32, Code::SQRTSD_XMM_XMMM64,
 };
 
+// The packed-integer workhorses. Saturating add/sub, the averaging pair, the high-half multiplies
+// and PSADBW/PMADDWD are all places where the obvious implementation is off by one somewhere: the
+// saturating forms have to clamp per lane at the right signedness, PAVG rounds up rather than
+// truncating, PMULHW keeps the high half of a SIGNED product while PMULHUW keeps the unsigned one,
+// and PSADBW/PMADDWD change lane width mid-operation. None of these thirty-four had ever run.
+constexpr std::array<Code, 34> kPackedInt = {
+    Code::PADDB_XMM_XMMM128,    Code::PADDW_XMM_XMMM128,    Code::PADDD_XMM_XMMM128,
+    Code::PADDQ_XMM_XMMM128,    Code::PADDSB_XMM_XMMM128,   Code::PADDSW_XMM_XMMM128,
+    Code::PADDUSB_XMM_XMMM128,  Code::PADDUSW_XMM_XMMM128,
+    Code::PSUBB_XMM_XMMM128,    Code::PSUBW_XMM_XMMM128,    Code::PSUBD_XMM_XMMM128,
+    Code::PSUBQ_XMM_XMMM128,    Code::PSUBSB_XMM_XMMM128,   Code::PSUBSW_XMM_XMMM128,
+    Code::PSUBUSB_XMM_XMMM128,  Code::PSUBUSW_XMM_XMMM128,
+    Code::PCMPEQB_XMM_XMMM128,  Code::PCMPEQW_XMM_XMMM128,  Code::PCMPEQD_XMM_XMMM128,
+    Code::PCMPEQQ_XMM_XMMM128,  Code::PCMPGTB_XMM_XMMM128,  Code::PCMPGTW_XMM_XMMM128,
+    Code::PCMPGTD_XMM_XMMM128,  Code::PCMPGTQ_XMM_XMMM128,
+    Code::PAVGB_XMM_XMMM128,    Code::PAVGW_XMM_XMMM128,
+    Code::PMAXUB_XMM_XMMM128,   Code::PMINSW_XMM_XMMM128,
+    Code::PMULLW_XMM_XMMM128,   Code::PMULHW_XMM_XMMM128,   Code::PMULHUW_XMM_XMMM128,
+    Code::PMULUDQ_XMM_XMMM128,  Code::PMADDWD_XMM_XMMM128,  Code::PSADBW_XMM_XMMM128,
+};
+
+// The SSE move forms, in both directions. Every SIMD family generated so far reads memory and writes
+// a register; these are the first that write GUEST MEMORY from a vector register, which is a
+// different code path in every lane. The alignment rule splits them: the "A"/non-temporal forms
+// require 16 bytes, the "U" forms and LDDQU explicitly do not, and the scalar/m64 forms have no
+// requirement at all. Feeding a deliberately misaligned address to an aligned form now and then
+// keeps the #GP side compared too, since that is exactly where the packed float family had a hole.
+struct SseMoveForm {
+  Code code;
+  bool needs_alignment;
+};
+
+constexpr std::array<SseMoveForm, 16> kSseMoveLoad = {{
+    {Code::MOVAPS_XMM_XMMM128, true},  {Code::MOVAPD_XMM_XMMM128, true},
+    {Code::MOVDQA_XMM_XMMM128, true},  {Code::MOVNTDQA_XMM_M128, true},
+    {Code::MOVUPS_XMM_XMMM128, false}, {Code::MOVUPD_XMM_XMMM128, false},
+    {Code::MOVDQU_XMM_XMMM128, false}, {Code::LDDQU_XMM_M128, false},
+    {Code::MOVSS_XMM_XMMM32, false},   {Code::MOVSD_XMM_XMMM64, false},
+    {Code::MOVHPS_XMM_M64, false},     {Code::MOVHPD_XMM_M64, false},
+    {Code::MOVLPS_XMM_M64, false},     {Code::MOVLPD_XMM_M64, false},
+    {Code::MOVQ_XMM_XMMM64, false},    {Code::MOVDDUP_XMM_XMMM64, false},
+}};
+
+constexpr std::array<SseMoveForm, 15> kSseMoveStore = {{
+    {Code::MOVAPS_XMMM128_XMM, true},  {Code::MOVAPD_XMMM128_XMM, true},
+    {Code::MOVDQA_XMMM128_XMM, true},  {Code::MOVNTPS_M128_XMM, true},
+    {Code::MOVNTPD_M128_XMM, true},    {Code::MOVNTDQ_M128_XMM, true},
+    {Code::MOVUPS_XMMM128_XMM, false}, {Code::MOVUPD_XMMM128_XMM, false},
+    {Code::MOVDQU_XMMM128_XMM, false}, {Code::MOVSS_XMMM32_XMM, false},
+    {Code::MOVSD_XMMM64_XMM, false},   {Code::MOVHPS_M64_XMM, false},
+    {Code::MOVHPD_M64_XMM, false},     {Code::MOVLPS_M64_XMM, false},
+    {Code::MOVLPD_M64_XMM, false},
+}};
+
+[[nodiscard]] std::optional<Instruction> gen_sse_move(Ctx& c) {
+  c.flags_mask = 0;  // no move form touches EFLAGS
+  const bool store = rand_int(c.rng, 0, 1) == 0;
+  const auto form = store
+      ? kSseMoveStore[static_cast<std::size_t>(rand_int(c.rng, 0, static_cast<int>(kSseMoveStore.size()) - 1))]
+      : kSseMoveLoad[static_cast<std::size_t>(rand_int(c.rng, 0, static_cast<int>(kSseMoveLoad.size()) - 1))];
+
+  // One in eight aligned forms gets a misaligned address on purpose, so the #GP path stays compared
+  // rather than only the success path.
+  const bool force_misaligned = form.needs_alignment && rand_int(c.rng, 0, 7) == 0;
+  const auto disp = (form.needs_alignment && !force_misaligned) ? aligned_disp8(c.rng, 16)
+                                                                : random_disp8(c.rng);
+
+  const int reg = pick_xmm_index(c.rng);
+  if (store) {
+    c.touches_memory = true;
+    return InstructionFactory::with2(form.code, mem_operand(disp), xmm_of(reg));
+  }
+  // The M-only load forms have no register-source encoding at all.
+  const bool mem_only = form.code == Code::MOVNTDQA_XMM_M128 || form.code == Code::LDDQU_XMM_M128 ||
+                        form.code == Code::MOVHPS_XMM_M64 || form.code == Code::MOVHPD_XMM_M64 ||
+                        form.code == Code::MOVLPS_XMM_M64 || form.code == Code::MOVLPD_XMM_M64;
+  if (mem_only || rand_int(c.rng, 0, 2) != 0) {
+    c.touches_memory = true;
+    return InstructionFactory::with2(form.code, xmm_of(reg), mem_operand(disp));
+  }
+  return InstructionFactory::with2(form.code, xmm_of(reg), xmm_of(pick_xmm_index(c.rng)));
+}
+
+[[nodiscard]] std::optional<Instruction> gen_packed_int(Ctx& c) {
+  c.flags_mask = 0;  // none of these touch EFLAGS
+  const Code code = kPackedInt[static_cast<std::size_t>(rand_int(c.rng, 0, static_cast<int>(kPackedInt.size()) - 1))];
+  const int d = pick_xmm_index(c.rng);
+  if (rand_int(c.rng, 0, 3) == 0) {
+    c.touches_memory = true;
+    // The legacy m128 forms all require a 16-byte-aligned source, so keep the displacement aligned
+    // rather than spending three quarters of this family's budget re-proving the same #GP.
+    return InstructionFactory::with2(code, xmm_of(d), mem_operand(aligned_disp8(c.rng, 16)));
+  }
+  const int s = pick_xmm_index(c.rng);
+  return InstructionFactory::with2(code, xmm_of(d), xmm_of(s));
+}
+
 [[nodiscard]] std::optional<Instruction> gen_sse_arith(Ctx& c) {
   c.flags_mask = 0;  // none of these touch EFLAGS
   const Code code = kSseArith[static_cast<std::size_t>(rand_int(c.rng, 0, static_cast<int>(kSseArith.size()) - 1))];
@@ -1426,7 +1532,7 @@ constexpr std::array<Code, 28> kSseArith = {
 // -------------------------------------------------------------- dispatch
 
 using GenFn = std::optional<Instruction> (*)(Ctx&);
-constexpr std::array<GenFn, 33> kFamilies = {
+constexpr std::array<GenFn, 35> kFamilies = {
     gen_alu, gen_test, gen_unary, gen_shift, gen_mov, gen_movx, gen_movsxd,
     gen_pushpop, gen_lea, gen_jcc, gen_jmp, gen_call, gen_ret, gen_setcc,
     gen_cmovcc, gen_bt, gen_rmsrc, gen_bswap,
@@ -1434,7 +1540,7 @@ constexpr std::array<GenFn, 33> kFamilies = {
     gen_string_ops,
     gen_muldiv, gen_imul_multi,
     gen_simd_shuffle, gen_simd_logic, gen_simd_pack, gen_simd_shift, gen_simd_fp,
-    gen_sse_arith,
+    gen_sse_arith, gen_packed_int, gen_sse_move,
     // gen_privileged / gen_privileged_movcrdr: intentionally excluded, see
     // the comment above their definitions.
 };
