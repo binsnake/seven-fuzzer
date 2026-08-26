@@ -39,10 +39,11 @@ endif()
 set(SEVEN_VECTOR_BITS 512)
 set(SEVEN_MAX_VECTOR_BYTES 64)
 
+# Pinned for the same reason as asmjit: this is the floating-point core and master moves.
 FetchContent_Declare(
   softfloat
   GIT_REPOSITORY https://github.com/ucb-bar/berkeley-softfloat-3.git
-  GIT_TAG        master
+  GIT_TAG        a0c6494cdc11865811dec815d5c0049fba9d82a8
 )
 FetchContent_GetProperties(softfloat)
 if(NOT softfloat_POPULATED)
@@ -136,10 +137,13 @@ endif()
 
 set(ASMJIT_STATIC ON CACHE BOOL "" FORCE)
 set(ASMJIT_TEST OFF CACHE BOOL "" FORCE)
+# Pinned instead of tracking master. asmjit is what actually emits the host machine code the JIT
+# runs, so a moving branch is both a reproducibility problem and the shortest route from an
+# upstream compromise straight into every fresh build. Bump it deliberately, with a test run.
 FetchContent_Declare(
   asmjit
   GIT_REPOSITORY https://github.com/asmjit/asmjit.git
-  GIT_TAG        master
+  GIT_TAG        0bd5787b54b575ed94bf32ac452153b34385c514
 )
 FetchContent_MakeAvailable(asmjit)
 
