@@ -1098,7 +1098,13 @@ constexpr std::array<Code, 4> kSimdFpCompare = {
   const bool use_mem = rand_int(c.rng, 0, 2) == 0;
   const Code code = use_cl ? (left ? kShldCl : kShrdCl)[wi] : (left ? kShldImm : kShrdImm)[wi];
 
+  // A 16-bit double-shift masks its count to 5 bits, so a random one routinely exceeds the operand
+  // size -- which Intel leaves explicitly undefined, in the result AND the flags. Comparing that
+  // against hardware reports two equally-correct engines as diverging, so keep 16-bit counts in
+  // range and let the wider forms stay fully random (their masked counts never exceed the operand).
+  const bool narrow = w == Width::W16;
   if (use_cl) {
+    if (narrow) { c.force_gpr[1] = static_cast<std::uint64_t>(rand_int(c.rng, 0, 15)); }
     if (use_mem) {
       c.touches_memory = true;
       return InstructionFactory::with3(code, mem_operand(random_disp8(c.rng)), reg_of(w, s), Register::CL);
@@ -1107,6 +1113,7 @@ constexpr std::array<Code, 4> kSimdFpCompare = {
   }
   std::int32_t imm = static_cast<std::int32_t>(random_imm(c.rng, 8));
   if (rand_int(c.rng, 0, 4) != 0) imm &= 0x3F;
+  if (narrow) imm &= 0x0F;
   if (use_mem) {
     c.touches_memory = true;
     auto instr = InstructionFactory::with3(code, mem_operand(random_disp8(c.rng)), reg_of(w, s), imm);
