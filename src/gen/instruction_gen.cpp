@@ -14,6 +14,7 @@
 #include <iced_x86/memory_operand.hpp>
 #include <iced_x86/op_kind.hpp>
 #include <iced_x86/register.hpp>
+#include <iced_x86/rep_prefix_kind.hpp>
 
 namespace sf {
 
@@ -563,6 +564,83 @@ constexpr std::array<Width, 6> kMovxSrcW = {Width::W8, Width::W8, Width::W8, Wid
   static constexpr std::array<Code, 3> kLea = {Code::LEA_R16_M, Code::LEA_R32_M, Code::LEA_R64_M};
   return InstructionFactory::with2(kLea[static_cast<std::size_t>(widx16_32_64(w))], reg_of(w, d),
                                    mem_operand(random_disp8(c.rng)));
+}
+
+// MOVS/CMPS/SCAS/STOS/LODS. These are the only instructions whose direction depends on DF, they
+// advance RSI/RDI themselves, and a rep prefix makes one instruction a whole loop -- all state the
+// rest of the generator never touches. seven has already had two serious bugs in exactly this area
+// (a rep-string cancellation gap, and a DF leak that reversed the host's own copies), and until now
+// not one of these twenty codes had ever been generated.
+//
+// RSI/RDI are pinned mid-window rather than at its base: DF=1 walks them DOWNWARD, and starting at
+// kDataBase would march straight out of the compared window and off the page for reasons that have
+// nothing to do with the instruction under test. A small count keeps every iteration inside the
+// window in either direction.
+[[nodiscard]] std::optional<Instruction> gen_string_ops(Ctx& c) {
+  using iced_x86::RepPrefixKind;
+  c.touches_memory = true;
+
+  constexpr std::uint64_t kMidWindow = kDataBase + (kDataWindow / 2);
+  c.force_gpr[6] = kMidWindow;  // RSI
+  c.force_gpr[7] = kMidWindow;  // RDI
+
+  const int family = rand_int(c.rng, 0, 4);
+  const int wi = rand_int(c.rng, 0, 3);
+  // A rep prefix turns this into a loop, so the count has to stay small enough that every iteration
+  // lands inside the window whichever way DF sends it.
+  const int rep_pick = rand_int(c.rng, 0, 2);
+  const auto rep = rep_pick == 0   ? RepPrefixKind::NONE
+                   : rep_pick == 1 ? RepPrefixKind::REPE
+                                   : RepPrefixKind::REPNE;
+  if (rep != RepPrefixKind::NONE) {
+    // Only 0 or 1. A REP string instruction is architecturally interruptible between iterations,
+    // and both oracles single-step it that way -- hardware traps after each iteration with TF set,
+    // and Unicorn stops after one too -- while seven runs the whole loop inside one step(). With a
+    // count above 1 every single rep form reports a divergence that is purely that difference in
+    // what one step means, which buries anything real. At 0 and 1 the two models agree exactly, so
+    // what is left compares the actual string semantics: DF direction, RSI/RDI advance, the flags
+    // CMPS/SCAS set, and the zero-count early out.
+    c.force_gpr[1] = static_cast<std::uint64_t>(rand_int(c.rng, 0, 1));  // RCX
+  }
+  constexpr std::uint32_t kAddr64 = 64;
+
+  switch (family) {
+    case 0:
+      switch (wi) {
+        case 0: return InstructionFactory::with_movsb(kAddr64, Register::NONE, rep);
+        case 1: return InstructionFactory::with_movsw(kAddr64, Register::NONE, rep);
+        case 2: return InstructionFactory::with_movsd(kAddr64, Register::NONE, rep);
+        default: return InstructionFactory::with_movsq(kAddr64, Register::NONE, rep);
+      }
+    case 1:
+      switch (wi) {
+        case 0: return InstructionFactory::with_cmpsb(kAddr64, Register::NONE, rep);
+        case 1: return InstructionFactory::with_cmpsw(kAddr64, Register::NONE, rep);
+        case 2: return InstructionFactory::with_cmpsd(kAddr64, Register::NONE, rep);
+        default: return InstructionFactory::with_cmpsq(kAddr64, Register::NONE, rep);
+      }
+    case 2:
+      switch (wi) {
+        case 0: return InstructionFactory::with_scasb(kAddr64, rep);
+        case 1: return InstructionFactory::with_scasw(kAddr64, rep);
+        case 2: return InstructionFactory::with_scasd(kAddr64, rep);
+        default: return InstructionFactory::with_scasq(kAddr64, rep);
+      }
+    case 3:
+      switch (wi) {
+        case 0: return InstructionFactory::with_stosb(kAddr64, rep);
+        case 1: return InstructionFactory::with_stosw(kAddr64, rep);
+        case 2: return InstructionFactory::with_stosd(kAddr64, rep);
+        default: return InstructionFactory::with_stosq(kAddr64, rep);
+      }
+    default:
+      switch (wi) {
+        case 0: return InstructionFactory::with_lodsb(kAddr64, Register::NONE, rep);
+        case 1: return InstructionFactory::with_lodsw(kAddr64, Register::NONE, rep);
+        case 2: return InstructionFactory::with_lodsd(kAddr64, Register::NONE, rep);
+        default: return InstructionFactory::with_lodsq(kAddr64, Register::NONE, rep);
+      }
+  }
 }
 
 // The A0-A3 absolute-address forms. No ModRM and no base register at all -- the address is an
@@ -1318,11 +1396,12 @@ constexpr std::array<Code, 4> kSimdFpCompare = {
 // -------------------------------------------------------------- dispatch
 
 using GenFn = std::optional<Instruction> (*)(Ctx&);
-constexpr std::array<GenFn, 31> kFamilies = {
+constexpr std::array<GenFn, 32> kFamilies = {
     gen_alu, gen_test, gen_unary, gen_shift, gen_mov, gen_movx, gen_movsxd,
     gen_pushpop, gen_lea, gen_jcc, gen_jmp, gen_call, gen_ret, gen_setcc,
     gen_cmovcc, gen_bt, gen_rmsrc, gen_bswap,
     gen_loop, gen_xchg, gen_xadd_cmpxchg, gen_shld_shrd, gen_movbe_crc32_nop, gen_moffs,
+    gen_string_ops,
     gen_muldiv, gen_imul_multi,
     gen_simd_shuffle, gen_simd_logic, gen_simd_pack, gen_simd_shift, gen_simd_fp,
     // gen_privileged / gen_privileged_movcrdr: intentionally excluded, see
