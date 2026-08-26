@@ -89,6 +89,14 @@ struct Ctx {
   std::optional<int> bsf_bsr_src_reg;
   std::optional<std::int8_t> bsf_bsr_src_mem_disp;
   int bsf_bsr_width_bytes = 0;
+  // Plants a known qword in the scratch page after next() has randomized it. Memory-indirect
+  // branches read their target from there, and a random one would land outside the mapped code
+  // page -- see the branch-target comment above gen_jcc for why that isn't comparable.
+  struct ForcedQword {
+    std::size_t offset;
+    std::uint64_t value;
+  };
+  std::optional<ForcedQword> force_data_qword;
 };
 
 [[nodiscard]] int rand_int(std::mt19937_64& rng, int lo, int hi) {
@@ -136,6 +144,21 @@ struct Ctx {
 
 [[nodiscard]] MemoryOperand mem_operand(std::int8_t disp) {
   return MemoryOperand::with_base_displ_size(Register::RDI, disp, 1);
+}
+
+// Somewhere inside the code page, for anything that has to branch to a real mapped address.
+[[nodiscard]] std::uint64_t random_code_target(std::mt19937_64& rng) {
+  return kCodeBase + static_cast<std::uint64_t>(rand_int(rng, 0, static_cast<int>(kPageSize) - 16));
+}
+
+// Picks a qword-aligned slot in the scratch window and plants a code-page address there, for the
+// memory-indirect JMP/CALL forms. Returns the displacement to address it with.
+[[nodiscard]] std::int8_t indirect_target_disp(Ctx& c) {
+  // Capped at 120, not the window size: the displacement rides in a signed byte, same constraint
+  // random_disp8 documents.
+  const auto offset = static_cast<std::size_t>(rand_int(c.rng, 0, 15)) * 8;
+  c.force_data_qword = Ctx::ForcedQword{offset, random_code_target(c.rng)};
+  return static_cast<std::int8_t>(offset);
 }
 
 [[nodiscard]] Width width16_32_64(std::mt19937_64& rng) {
@@ -488,6 +511,14 @@ constexpr std::array<Code, 16> kJcc = {
     Code::JS_REL8_64, Code::JNS_REL8_64, Code::JP_REL8_64, Code::JNP_REL8_64,
     Code::JL_REL8_64, Code::JGE_REL8_64, Code::JLE_REL8_64, Code::JG_REL8_64,
 };
+// Same condition order as kJcc. The rel32 forms are a separate Code entirely, and the encoder
+// never shrinks one into the other, so both have to be asked for by name to get covered.
+constexpr std::array<Code, 16> kJcc32 = {
+    Code::JO_REL32_64, Code::JNO_REL32_64, Code::JB_REL32_64, Code::JAE_REL32_64,
+    Code::JE_REL32_64, Code::JNE_REL32_64, Code::JBE_REL32_64, Code::JA_REL32_64,
+    Code::JS_REL32_64, Code::JNS_REL32_64, Code::JP_REL32_64, Code::JNP_REL32_64,
+    Code::JL_REL32_64, Code::JGE_REL32_64, Code::JLE_REL32_64, Code::JG_REL32_64,
+};
 constexpr std::array<Code, 16> kSetcc = {
     Code::SETO_RM8, Code::SETNO_RM8, Code::SETB_RM8, Code::SETAE_RM8,
     Code::SETE_RM8, Code::SETNE_RM8, Code::SETBE_RM8, Code::SETA_RM8,
@@ -521,21 +552,84 @@ constexpr std::array<Code, 16> kCmov64 = {
 // Comparing that would be comparing a single-step measurement artifact, not
 // a real execution difference, so every branch target stays in-page.
 [[nodiscard]] std::optional<Instruction> gen_jcc(Ctx& c) {
-  const Code code = kJcc[static_cast<std::size_t>(rand_int(c.rng, 0, 15))];
-  // rel8 reach: stay comfortably inside +/-127 of kCodeBase regardless of
-  // this instruction's own length.
-  const auto target = kCodeBase + static_cast<std::uint64_t>(rand_int(c.rng, 2, 120));
-  return InstructionFactory::with_branch(code, target);
+  const auto which = static_cast<std::size_t>(rand_int(c.rng, 0, 15));
+  if (rand_int(c.rng, 0, 1) == 0) {
+    // rel8 reach: stay comfortably inside +/-127 of kCodeBase regardless of
+    // this instruction's own length.
+    const auto target = kCodeBase + static_cast<std::uint64_t>(rand_int(c.rng, 2, 120));
+    return InstructionFactory::with_branch(kJcc[which], target);
+  }
+  return InstructionFactory::with_branch(kJcc32[which], random_code_target(c.rng));
 }
 [[nodiscard]] std::optional<Instruction> gen_jmp(Ctx& c) {
-  const auto target = kCodeBase + static_cast<std::uint64_t>(rand_int(c.rng, 2, 120));
-  return InstructionFactory::with_branch(Code::JMP_REL8_64, target);
+  switch (rand_int(c.rng, 0, 3)) {
+    case 0: {
+      const auto target = kCodeBase + static_cast<std::uint64_t>(rand_int(c.rng, 2, 120));
+      return InstructionFactory::with_branch(Code::JMP_REL8_64, target);
+    }
+    case 1:
+      return InstructionFactory::with_branch(Code::JMP_REL32_64, random_code_target(c.rng));
+    case 2: {
+      const int r = pick_reg_index(c.rng);
+      c.force_gpr[static_cast<std::size_t>(r)] = random_code_target(c.rng);
+      return InstructionFactory::with1(Code::JMP_RM64, reg_of(Width::W64, r));
+    }
+    default: {
+      const std::int8_t disp = indirect_target_disp(c);
+      c.touches_memory = true;
+      return InstructionFactory::with1(Code::JMP_RM64, mem_operand(disp));
+    }
+  }
 }
 [[nodiscard]] std::optional<Instruction> gen_call(Ctx& c) {
-  const auto target = kCodeBase + static_cast<std::uint64_t>(rand_int(c.rng, 0, static_cast<int>(kPageSize) - 16));
-  return InstructionFactory::with_branch(Code::CALL_REL32_64, target);
+  switch (rand_int(c.rng, 0, 2)) {
+    case 0:
+      return InstructionFactory::with_branch(Code::CALL_REL32_64, random_code_target(c.rng));
+    case 1: {
+      const int r = pick_reg_index(c.rng);
+      // RSP is pinned to the harness stack top; overwriting it with a code address would send the
+      // pushed return address somewhere unmapped instead of exercising the call itself.
+      if (r == 4) { return std::nullopt; }
+      c.force_gpr[static_cast<std::size_t>(r)] = random_code_target(c.rng);
+      return InstructionFactory::with1(Code::CALL_RM64, reg_of(Width::W64, r));
+    }
+    default: {
+      const std::int8_t disp = indirect_target_disp(c);
+      c.touches_memory = true;
+      return InstructionFactory::with1(Code::CALL_RM64, mem_operand(disp));
+    }
+  }
 }
-[[nodiscard]] std::optional<Instruction> gen_ret(Ctx&) { return InstructionFactory::with(Code::RETNQ); }
+[[nodiscard]] std::optional<Instruction> gen_ret(Ctx& c) {
+  if (rand_int(c.rng, 0, 1) == 0) { return InstructionFactory::with(Code::RETNQ); }
+  // Small, aligned pop counts only: the harness stack has 0x0F00 bytes of headroom above RSP, and
+  // a random imm16 would walk RSP off the mapped page for reasons that have nothing to do with RET.
+  const auto pop_bytes = rand_int(c.rng, 0, 32) * 8;
+  auto instr = InstructionFactory::with1(Code::RETNQ_IMM16, pop_bytes);
+  set_imm_kind(instr, 0, OpKind::IMMEDIATE16);
+  instr.set_immediate16(static_cast<std::uint16_t>(pop_bytes));
+  return instr;
+}
+
+// LOOP/JRCXZ read (and LOOP writes) the count register but define no flags at all, which makes
+// them a clean check that a branch family isn't clobbering flags on the side.
+constexpr std::array<Code, 6> kLoop = {
+    Code::LOOP_REL8_64_RCX,   Code::LOOP_REL8_64_ECX,   Code::LOOPE_REL8_64_RCX,
+    Code::LOOPE_REL8_64_ECX,  Code::LOOPNE_REL8_64_RCX, Code::LOOPNE_REL8_64_ECX,
+};
+
+[[nodiscard]] std::optional<Instruction> gen_loop(Ctx& c) {
+  const auto target = kCodeBase + static_cast<std::uint64_t>(rand_int(c.rng, 2, 120));
+  const int pick = rand_int(c.rng, 0, 7);
+  // A fully random RCX is essentially never near the zero boundary, which is the only interesting
+  // one here. Bias it small so both the taken and not-taken edges actually get exercised.
+  if (rand_int(c.rng, 0, 1) == 0) {
+    c.force_gpr[1] = static_cast<std::uint64_t>(rand_int(c.rng, 0, 3));
+  }
+  if (pick == 6) { return InstructionFactory::with_branch(Code::JRCXZ_REL8_64, target); }
+  if (pick == 7) { return InstructionFactory::with_branch(Code::JECXZ_REL8_64, target); }
+  return InstructionFactory::with_branch(kLoop[static_cast<std::size_t>(pick)], target);
+}
 
 [[nodiscard]] std::optional<Instruction> gen_setcc(Ctx& c) {
   const Code code = kSetcc[static_cast<std::size_t>(rand_int(c.rng, 0, 15))];
@@ -929,6 +1023,101 @@ constexpr std::array<Code, 4> kSimdFpCompare = {
   return InstructionFactory::with2(code, xmm_of(d), xmm_of(s));
 }
 
+// ------------------------------------------------- exchange / double-shift
+
+// The read-modify-write trio. XCHG against memory carries an implicit LOCK, and all three have a
+// second write-back that a plain ALU handler doesn't, which is exactly the part worth comparing.
+[[nodiscard]] std::optional<Instruction> gen_xchg(Ctx& c) {
+  static constexpr std::array<Code, 4> kRmR = {Code::XCHG_RM8_R8, Code::XCHG_RM16_R16,
+                                                Code::XCHG_RM32_R32, Code::XCHG_RM64_R64};
+  static constexpr std::array<Code, 3> kShort = {Code::XCHG_R16_AX, Code::XCHG_R32_EAX,
+                                                  Code::XCHG_R64_RAX};
+  c.flags_mask = 0;  // XCHG defines no flags
+  if (rand_int(c.rng, 0, 3) == 0) {
+    // The 0x90+r short form. Register 0 is excluded because `xchg rax,rax` is NOP's own encoding,
+    // which is a decode question rather than an exchange one.
+    const Width w = width16_32_64(c.rng);
+    const int r = rand_int(c.rng, 1, 15);
+    const Register acc = w == Width::W16 ? Register::AX : w == Width::W32 ? Register::EAX : Register::RAX;
+    return InstructionFactory::with2(kShort[static_cast<std::size_t>(widx16_32_64(w))], reg_of(w, r), acc);
+  }
+  const Width w = static_cast<Width>(rand_int(c.rng, 0, 3));
+  const Code code = kRmR[static_cast<std::size_t>(w)];
+  const int s = pick_reg_index(c.rng);
+  if (rand_int(c.rng, 0, 2) == 0) {
+    c.touches_memory = true;
+    return InstructionFactory::with2(code, mem_operand(random_disp8(c.rng)), reg_of(w, s));
+  }
+  return InstructionFactory::with2(code, reg_of(w, pick_reg_index(c.rng)), reg_of(w, s));
+}
+
+[[nodiscard]] std::optional<Instruction> gen_xadd_cmpxchg(Ctx& c) {
+  static constexpr std::array<Code, 4> kXadd = {Code::XADD_RM8_R8, Code::XADD_RM16_R16,
+                                                 Code::XADD_RM32_R32, Code::XADD_RM64_R64};
+  static constexpr std::array<Code, 4> kCmpxchg = {Code::CMPXCHG_RM8_R8, Code::CMPXCHG_RM16_R16,
+                                                    Code::CMPXCHG_RM32_R32, Code::CMPXCHG_RM64_R64};
+  const Width w = static_cast<Width>(rand_int(c.rng, 0, 3));
+  const bool is_xadd = rand_int(c.rng, 0, 1) == 0;
+  const Code code = (is_xadd ? kXadd : kCmpxchg)[static_cast<std::size_t>(w)];
+  const int s = pick_reg_index(c.rng);
+  if (rand_int(c.rng, 0, 2) == 0) {
+    c.touches_memory = true;
+    return InstructionFactory::with2(code, mem_operand(random_disp8(c.rng)), reg_of(w, s));
+  }
+  // CMPXCHG compares against the accumulator, and a fully random one never matches. Force the
+  // equal case half the time so the ZF-set branch and its accumulator write-back both get hit.
+  if (!is_xadd && rand_int(c.rng, 0, 1) == 0) {
+    const int d = pick_reg_index(c.rng);
+    if (d != 0) {
+      const auto shared = random_interesting_u64(c.rng);
+      c.force_gpr[0] = shared;
+      c.force_gpr[static_cast<std::size_t>(d)] = shared;
+    }
+    return InstructionFactory::with2(code, reg_of(w, d), reg_of(w, s));
+  }
+  return InstructionFactory::with2(code, reg_of(w, pick_reg_index(c.rng)), reg_of(w, s));
+}
+
+[[nodiscard]] std::optional<Instruction> gen_shld_shrd(Ctx& c) {
+  static constexpr std::array<Code, 3> kShldCl = {Code::SHLD_RM16_R16_CL, Code::SHLD_RM32_R32_CL,
+                                                   Code::SHLD_RM64_R64_CL};
+  static constexpr std::array<Code, 3> kShldImm = {Code::SHLD_RM16_R16_IMM8, Code::SHLD_RM32_R32_IMM8,
+                                                    Code::SHLD_RM64_R64_IMM8};
+  static constexpr std::array<Code, 3> kShrdCl = {Code::SHRD_RM16_R16_CL, Code::SHRD_RM32_R32_CL,
+                                                   Code::SHRD_RM64_R64_CL};
+  static constexpr std::array<Code, 3> kShrdImm = {Code::SHRD_RM16_R16_IMM8, Code::SHRD_RM32_R32_IMM8,
+                                                    Code::SHRD_RM64_R64_IMM8};
+  // OF is only defined for a 1-bit shift and AF is undefined whenever a shift happens, so neither
+  // is comparable against a randomized count.
+  c.flags_mask &= ~(0x0800ull | 0x0010ull);
+  const Width w = width16_32_64(c.rng);
+  const auto wi = static_cast<std::size_t>(widx16_32_64(w));
+  const bool left = rand_int(c.rng, 0, 1) == 0;
+  const bool use_cl = rand_int(c.rng, 0, 1) == 0;
+  const int s = pick_reg_index(c.rng);
+  const bool use_mem = rand_int(c.rng, 0, 2) == 0;
+  const Code code = use_cl ? (left ? kShldCl : kShrdCl)[wi] : (left ? kShldImm : kShrdImm)[wi];
+
+  if (use_cl) {
+    if (use_mem) {
+      c.touches_memory = true;
+      return InstructionFactory::with3(code, mem_operand(random_disp8(c.rng)), reg_of(w, s), Register::CL);
+    }
+    return InstructionFactory::with3(code, reg_of(w, pick_reg_index(c.rng)), reg_of(w, s), Register::CL);
+  }
+  std::int32_t imm = static_cast<std::int32_t>(random_imm(c.rng, 8));
+  if (rand_int(c.rng, 0, 4) != 0) imm &= 0x3F;
+  if (use_mem) {
+    c.touches_memory = true;
+    auto instr = InstructionFactory::with3(code, mem_operand(random_disp8(c.rng)), reg_of(w, s), imm);
+    set_imm8(instr, 2, static_cast<std::uint64_t>(imm));
+    return instr;
+  }
+  auto instr = InstructionFactory::with3(code, reg_of(w, pick_reg_index(c.rng)), reg_of(w, s), imm);
+  set_imm8(instr, 2, static_cast<std::uint64_t>(imm));
+  return instr;
+}
+
 // ------------------------------------------------------- privileged (ring 0)
 //
 // NOT wired into kFamilies below -- excluded from generation pending a real
@@ -984,10 +1173,11 @@ constexpr std::array<Code, 4> kSimdFpCompare = {
 // -------------------------------------------------------------- dispatch
 
 using GenFn = std::optional<Instruction> (*)(Ctx&);
-constexpr std::array<GenFn, 25> kFamilies = {
+constexpr std::array<GenFn, 29> kFamilies = {
     gen_alu, gen_test, gen_unary, gen_shift, gen_mov, gen_movx, gen_movsxd,
     gen_pushpop, gen_lea, gen_jcc, gen_jmp, gen_call, gen_ret, gen_setcc,
     gen_cmovcc, gen_bt, gen_rmsrc, gen_bswap,
+    gen_loop, gen_xchg, gen_xadd_cmpxchg, gen_shld_shrd,
     gen_muldiv, gen_imul_multi,
     gen_simd_shuffle, gen_simd_logic, gen_simd_pack, gen_simd_shift, gen_simd_fp,
     // gen_privileged / gen_privileged_movcrdr: intentionally excluded, see
@@ -1050,6 +1240,13 @@ TestCase InstructionGenerator::next() {
       tc.initial.rflags = fl;
 
       for (auto& b : tc.data_seed) b = static_cast<std::uint8_t>(rand_int(rng_, 0, 255));
+
+      if (c.force_data_qword.has_value() && c.force_data_qword->offset + 8 <= tc.data_seed.size()) {
+        for (std::size_t b = 0; b < 8; ++b) {
+          tc.data_seed[c.force_data_qword->offset + b] =
+              static_cast<std::uint8_t>(c.force_data_qword->value >> (8 * b));
+        }
+      }
 
       if (c.bsf_bsr_dest.has_value()) {
         std::uint64_t src_val = 0;
