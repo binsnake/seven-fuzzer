@@ -149,7 +149,9 @@ FetchContent_MakeAvailable(asmjit)
 
 add_library(seven_jit STATIC
   ${SEVEN_JIT_ROOT}/seven_jit/src/block_compiler.cpp
+  ${SEVEN_JIT_ROOT}/seven_jit/src/jit_classify.cpp
   ${SEVEN_JIT_ROOT}/seven_jit/src/jit_executor.cpp
+  ${SEVEN_JIT_ROOT}/seven_jit/src/jit_trampolines.cpp
 )
 target_include_directories(seven_jit PUBLIC "${SEVEN_JIT_ROOT}/seven_jit/include")
 target_link_libraries(seven_jit PUBLIC seven_core asmjit::asmjit)
@@ -158,7 +160,7 @@ if(MSVC)
 endif()
 if(WIN32)
   # RtlAddGrowableFunctionTable/RtlGrowFunctionTable/RtlDeleteGrowableFunctionTable
-  # (block_compiler.cpp's UnwindAwareJitRuntime) resolve against ntdll, not a
+  # (jit_unwind.hpp's UnwindAwareJitRuntime) resolve against ntdll, not a
   # normal SDK import lib.
   target_link_libraries(seven_jit PUBLIC ntdll)
 endif()
