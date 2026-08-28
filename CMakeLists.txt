@@ -135,6 +135,15 @@ if(MSVC)
   target_compile_options(seven_core PRIVATE /WX-)
 endif()
 
+# Ends every guest page against an unmapped page, so an access that runs off the end of one faults
+# instead of landing in live heap. That gives the fuzzer an oracle it can trust without trusting the
+# JIT: see report_guard_page_escape in src/main.cpp. Costs a page of address space per guest page
+# and a VirtualAlloc per mapped page, which is why it is off by default.
+option(SEVEN_GUARDED_PAGES "Put a guard page behind every guest page" OFF)
+if(SEVEN_GUARDED_PAGES)
+  target_compile_definitions(seven_core PUBLIC SEVEN_GUARDED_PAGES)
+endif()
+
 # ------------------------------------------------------------------- seven_jit
 # BlockCompiler/JitExecutor, reused read-only from the sibling seven-jit checkout, linked straight
 # against the seven_core target built above -- SEVEN_ROOT and seven-jit's own vendor/seven-emulator

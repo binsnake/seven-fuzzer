@@ -15,7 +15,15 @@
 // parallelizing it worthwhile.
 //
 // Usage: seven_fuzzer.exe [iterations] [seed] [--no-hw] [--jit] [--threads N] [--verbose-from N]
-//                          [--watchdog-seconds N] [--sweep-seeds N]
+//                          [--watchdog-seconds N] [--sweep-seeds N] [--self-test-escape]
+//
+// Configured with -DSEVEN_GUARDED_PAGES=ON this also runs an escape lane, whose oracle is not
+// "did the engines disagree" but "did any access land outside the guest arena". Guest page bytes
+// end against an unmapped page in that build, so an emitted access that runs off the end of a page
+// faults, and report_guard_page_escape below turns that fault into a finding. --self-test-escape
+// commits the violation on purpose: a clean escape-lane run means nothing unless the oracle is
+// known to be armed, and a build that lost its guard pages reports the same 0 findings as one that
+// worked.
 //
 // --jit runs the "seven" side through seven-jit's JitExecutor instead of seven_core's plain
 // interpreter (see lanes/seven_jit_lane.hpp) -- everything else about the run (TestCase generation,
@@ -59,6 +67,7 @@
 #include "lanes/seven_lane.hpp"
 #include "lanes/unicorn_lane.hpp"
 #include "report/report.hpp"
+#include "seven/guarded_allocator.hpp"
 #include "seven_jit/jit_executor.hpp"
 
 #pragma comment(lib, "dbghelp.lib")
@@ -109,6 +118,39 @@ LONG WINAPI write_crash_dump(EXCEPTION_POINTERS* ep) {
   }
   return EXCEPTION_EXECUTE_HANDLER;  // terminate after dumping
 }
+
+#if defined(SEVEN_GUARDED_PAGES)
+// The escape oracle. Guest page bytes end against an unmapped page in this build, so an access that
+// runs off the end of a page faults, and that fault is a finding no matter which engine produced it
+// or whether the guest could have caused it deliberately.
+//
+// This has to be a vectored handler rather than the unhandled filter above. Vectored handlers run
+// ahead of every SEH frame in the process, and the JIT installs its own: left to itself it would
+// take the guard-page fault, decide it was an ordinary guest page fault, report page_fault and keep
+// executing. The escape would be masked as a routine event and the run would finish clean.
+LONG WINAPI report_guard_page_escape(EXCEPTION_POINTERS* ep) {
+  const auto* rec = ep->ExceptionRecord;
+  if (rec->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || rec->NumberParameters < 2) {
+    return EXCEPTION_CONTINUE_SEARCH;
+  }
+  const auto* fault = reinterpret_cast<const void*>(rec->ExceptionInformation[1]);
+  const auto hit = seven::classify_faulting_address(fault);
+  if (!hit.is_guard_page) return EXCEPTION_CONTINUE_SEARCH;
+
+  std::fprintf(stderr,
+               "[escape] %s at %p ran %zu bytes past the end of a guest page -- faulting ip %p\n",
+               rec->ExceptionInformation[0] != 0 ? "a store" : "a load", fault,
+               hit.bytes_past_payload, rec->ExceptionAddress);
+  std::fflush(stderr);
+
+  // Dump before dying so the emitted code and the guest state that reached it are both recoverable,
+  // then take the process down rather than returning: continuing hands the fault straight to the
+  // handler this exists to get ahead of.
+  write_crash_dump(ep);
+  TerminateProcess(GetCurrentProcess(), 0xE5CA9Eu);
+  return EXCEPTION_CONTINUE_SEARCH;
+}
+#endif
 
 // Called from the watchdog thread when a worker stops making progress -- unlike
 // write_crash_dump above, there's no exception to hang the dump off of, so this
@@ -650,6 +692,10 @@ int run_seed_sweep(std::uint64_t base_seed, std::uint64_t iterations_per_seed, u
 
 int main(int argc, char** argv) {
   SetUnhandledExceptionFilter(write_crash_dump);
+#if defined(SEVEN_GUARDED_PAGES)
+  AddVectoredExceptionHandler(1, report_guard_page_escape);
+  std::printf("seven-fuzzer: guard pages ON -- an access past the end of a guest page is a finding\n");
+#endif
   std::uint64_t iterations = 200000;
   std::uint64_t seed = 0xC0FFEEULL;
   bool use_hw = true;
@@ -659,6 +705,7 @@ int main(int argc, char** argv) {
   bool threads_explicit = false;
   unsigned int watchdog_seconds = 60;  // 0 disables; see run_watchdog
   unsigned int sweep_seeds = 0;  // 0 = normal single run; see run_seed_sweep
+  bool self_test_escape = false;  // see below; only does anything in a guarded build
 
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
@@ -674,6 +721,8 @@ int main(int argc, char** argv) {
       // different engine under test. Off by default so a bare run still verifies the interpreter,
       // which is what most of this fuzzer's existing findings/methodology assumes.
       use_jit = true;
+    } else if (a == "--self-test-escape") {
+      self_test_escape = true;
     } else if (a == "--no-unicorn") {
       g_no_unicorn = true;
     } else if (a == "--no-seven") {
@@ -688,6 +737,30 @@ int main(int argc, char** argv) {
     } else if (i == 2) {
       seed = std::strtoull(a.c_str(), nullptr, 0);
     }
+  }
+
+  // A clean escape-lane run only means something if the oracle was actually armed, and there is no
+  // way to tell that from the outside: a guarded build that silently lost its guard pages reports
+  // exactly the same "0 findings" as one that ran perfectly. So this deliberately commits the
+  // violation the lane exists to catch, and the run is only trustworthy if it dies here.
+  if (self_test_escape) {
+#if defined(SEVEN_GUARDED_PAGES)
+    seven::Memory probe;
+    probe.map(0x10000, seven::Memory::kPageSize);
+    auto* page = probe.page_data(0x10000 / seven::Memory::kPageSize);
+    if (page == nullptr) {
+      std::printf("[self-test] FAILED: the probe page did not map\n");
+      return 2;
+    }
+    std::printf("[self-test] storing one byte past the end of guest page 0x10000\n");
+    std::fflush(stdout);
+    *reinterpret_cast<volatile std::byte*>(page + seven::Memory::kPageSize) = std::byte{0x41};
+    std::printf("[self-test] FAILED: the store past the end of the page did not fault\n");
+    return 2;
+#else
+    std::printf("[self-test] FAILED: this build has no guard pages, configure -DSEVEN_GUARDED_PAGES=ON\n");
+    return 2;
+#endif
   }
 
   if (sweep_seeds > 0) {
