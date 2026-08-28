@@ -7,6 +7,8 @@
 #include <optional>
 #include <vector>
 
+#include "common/host_caps.hpp"
+
 #include <iced_x86/code.hpp>
 #include <iced_x86/encoder.hpp>
 #include <iced_x86/instruction.hpp>
@@ -1451,6 +1453,359 @@ constexpr std::array<SseMoveForm, 15> kSseMoveStore = {{
   return InstructionFactory::with2(code, xmm_of(d), xmm_of(s));
 }
 
+// ------------------------------------------------ VEX / EVEX SIMD (128-bit)
+//
+// seven registers 519 VEX and EVEX handlers and until now the generator produced exactly none of
+// them: everything above is legacy SSE. The reason it was held back was that seven is built with
+// SEVEN_ENABLE_AVX512=1 whatever the host is, so on a machine without real AVX-512 every EVEX case
+// would be "seven executed it, hardware #UD'd" -- thousands of identical divergences saying nothing
+// about seven. host_caps() answers that question at startup instead of guessing, so the corpus now
+// stays inside what the hardware oracle can actually adjudicate.
+//
+// Three things keep this to 128-bit forms with XMM0-15 and no mask register:
+//   - RegState carries the low and high 64 bits of XMM0-15 and nothing else, because the hardware
+//     lane reads its result out of CONTEXT.FltSave, which is the legacy FXSAVE area. YMM and ZMM
+//     upper lanes and XMM16-31 have no slot to be compared in, so generating them would exercise
+//     the engines without ever checking the answer.
+//   - Nothing anywhere sets K0-K7, so a masked EVEX form would merge against whatever the register
+//     happened to hold in each lane and diverge for a reason that isn't a bug. Every EVEX form here
+//     encodes with no mask.
+//   - AVX-512 is required whole (F+VL+BW+DQ) rather than per-instruction. A host missing one of the
+//     four skips EVEX entirely, which loses coverage on that host but never invents a finding.
+//
+// The upper lanes a VEX.128 write is supposed to zero are therefore not compared. That is a real
+// coverage gap and the reason for it is the FXSAVE area, not an opinion about it being unimportant.
+
+enum class VexShape : std::uint8_t {
+  kDstSrcRm,    // dst, src1, src2-or-m128
+  kDstRm,       // dst, src-or-m128
+  kRmDst,       // dst-or-m128, src   (store direction)
+  kDstSrcImm,   // dst, src, imm8     (shifts by immediate)
+  kDstSrcSrc,   // dst, src1, src2    (register only)
+  kDstRmImm,    // dst, src-or-m128, imm8
+  kDstSrcRm64,  // dst, src1, src2-or-m64   (scalar double)
+  kDstSrcRm32,  // dst, src1, src2-or-m32   (scalar single)
+  kDstRm64,     // dst, src-or-m64
+  kDstSrcRmImm, // dst, src1, src2-or-m128, imm8
+};
+
+struct VexEntry {
+  Code code;
+  VexShape shape;
+  bool evex;
+  // The real Code name ends in B32 or B64, meaning an EVEX memory source may carry {1toN}: one
+  // element read and repeated across the operand. Worth generating, since the element size comes
+  // from a different field than the operand size and reading the wrong one is silent.
+  bool broadcast;
+};
+
+// Derived from seven's own handled_codes.def rather than typed out, so the list cannot drift from
+// what the emulator claims to support and cannot contain a mnemonic that does not exist.
+constexpr std::array<VexEntry, 204> kVexSimd = {{
+    {Code::EVEX_VMOVAPD_XMMM128_K1Z_XMM, VexShape::kRmDst, true, false},
+    {Code::EVEX_VMOVAPD_XMM_K1Z_XMMM128, VexShape::kDstRm, true, false},
+    {Code::EVEX_VMOVAPS_XMMM128_K1Z_XMM, VexShape::kRmDst, true, false},
+    {Code::EVEX_VMOVAPS_XMM_K1Z_XMMM128, VexShape::kDstRm, true, false},
+    {Code::EVEX_VMOVDDUP_XMM_K1Z_XMMM64, VexShape::kDstRm64, true, false},
+    {Code::EVEX_VMOVDQA32_XMMM128_K1Z_XMM, VexShape::kRmDst, true, false},
+    {Code::EVEX_VMOVDQA32_XMM_K1Z_XMMM128, VexShape::kDstRm, true, false},
+    {Code::EVEX_VMOVDQA64_XMMM128_K1Z_XMM, VexShape::kRmDst, true, false},
+    {Code::EVEX_VMOVDQA64_XMM_K1Z_XMMM128, VexShape::kDstRm, true, false},
+    {Code::EVEX_VMOVDQU16_XMMM128_K1Z_XMM, VexShape::kRmDst, true, false},
+    {Code::EVEX_VMOVDQU16_XMM_K1Z_XMMM128, VexShape::kDstRm, true, false},
+    {Code::EVEX_VMOVDQU32_XMMM128_K1Z_XMM, VexShape::kRmDst, true, false},
+    {Code::EVEX_VMOVDQU32_XMM_K1Z_XMMM128, VexShape::kDstRm, true, false},
+    {Code::EVEX_VMOVDQU64_XMMM128_K1Z_XMM, VexShape::kRmDst, true, false},
+    {Code::EVEX_VMOVDQU64_XMM_K1Z_XMMM128, VexShape::kDstRm, true, false},
+    {Code::EVEX_VMOVDQU8_XMMM128_K1Z_XMM, VexShape::kRmDst, true, false},
+    {Code::EVEX_VMOVDQU8_XMM_K1Z_XMMM128, VexShape::kDstRm, true, false},
+    {Code::EVEX_VMOVHLPS_XMM_XMM_XMM, VexShape::kDstSrcSrc, true, false},
+    {Code::EVEX_VMOVLHPS_XMM_XMM_XMM, VexShape::kDstSrcSrc, true, false},
+    {Code::EVEX_VMOVQ_XMM_XMMM64, VexShape::kDstRm64, true, false},
+    {Code::EVEX_VMOVSD_XMM_K1Z_XMM_XMM, VexShape::kDstSrcSrc, true, false},
+    {Code::EVEX_VMOVSHDUP_XMM_K1Z_XMMM128, VexShape::kDstRm, true, false},
+    {Code::EVEX_VMOVSLDUP_XMM_K1Z_XMMM128, VexShape::kDstRm, true, false},
+    {Code::EVEX_VMOVSS_XMM_K1Z_XMM_XMM, VexShape::kDstSrcSrc, true, false},
+    {Code::EVEX_VMOVUPD_XMMM128_K1Z_XMM, VexShape::kRmDst, true, false},
+    {Code::EVEX_VMOVUPD_XMM_K1Z_XMMM128, VexShape::kDstRm, true, false},
+    {Code::EVEX_VMOVUPS_XMMM128_K1Z_XMM, VexShape::kRmDst, true, false},
+    {Code::EVEX_VMOVUPS_XMM_K1Z_XMMM128, VexShape::kDstRm, true, false},
+    {Code::EVEX_VPACKSSDW_XMM_K1Z_XMM_XMMM128B32, VexShape::kDstSrcRm, true, true},
+    {Code::EVEX_VPACKSSWB_XMM_K1Z_XMM_XMMM128, VexShape::kDstSrcRm, true, false},
+    {Code::EVEX_VPACKUSWB_XMM_K1Z_XMM_XMMM128, VexShape::kDstSrcRm, true, false},
+    {Code::EVEX_VPADDB_XMM_K1Z_XMM_XMMM128, VexShape::kDstSrcRm, true, false},
+    {Code::EVEX_VPADDD_XMM_K1Z_XMM_XMMM128B32, VexShape::kDstSrcRm, true, true},
+    {Code::EVEX_VPADDQ_XMM_K1Z_XMM_XMMM128B64, VexShape::kDstSrcRm, true, true},
+    {Code::EVEX_VPADDSB_XMM_K1Z_XMM_XMMM128, VexShape::kDstSrcRm, true, false},
+    {Code::EVEX_VPADDSW_XMM_K1Z_XMM_XMMM128, VexShape::kDstSrcRm, true, false},
+    {Code::EVEX_VPADDUSB_XMM_K1Z_XMM_XMMM128, VexShape::kDstSrcRm, true, false},
+    {Code::EVEX_VPADDUSW_XMM_K1Z_XMM_XMMM128, VexShape::kDstSrcRm, true, false},
+    {Code::EVEX_VPADDW_XMM_K1Z_XMM_XMMM128, VexShape::kDstSrcRm, true, false},
+    {Code::EVEX_VPANDD_XMM_K1Z_XMM_XMMM128B32, VexShape::kDstSrcRm, true, true},
+    {Code::EVEX_VPANDND_XMM_K1Z_XMM_XMMM128B32, VexShape::kDstSrcRm, true, true},
+    {Code::EVEX_VPANDNQ_XMM_K1Z_XMM_XMMM128B64, VexShape::kDstSrcRm, true, true},
+    {Code::EVEX_VPANDQ_XMM_K1Z_XMM_XMMM128B64, VexShape::kDstSrcRm, true, true},
+    {Code::EVEX_VPAVGB_XMM_K1Z_XMM_XMMM128, VexShape::kDstSrcRm, true, false},
+    {Code::EVEX_VPAVGW_XMM_K1Z_XMM_XMMM128, VexShape::kDstSrcRm, true, false},
+    {Code::EVEX_VPMULLW_XMM_K1Z_XMM_XMMM128, VexShape::kDstSrcRm, true, false},
+    {Code::EVEX_VPORD_XMM_K1Z_XMM_XMMM128B32, VexShape::kDstSrcRm, true, true},
+    {Code::EVEX_VPORQ_XMM_K1Z_XMM_XMMM128B64, VexShape::kDstSrcRm, true, true},
+    {Code::EVEX_VPSLLD_XMM_K1Z_XMMM128B32_IMM8, VexShape::kDstRmImm, true, true},
+    {Code::EVEX_VPSLLD_XMM_K1Z_XMM_XMMM128, VexShape::kDstSrcRm, true, false},
+    {Code::EVEX_VPSLLQ_XMM_K1Z_XMMM128B64_IMM8, VexShape::kDstRmImm, true, true},
+    {Code::EVEX_VPSLLQ_XMM_K1Z_XMM_XMMM128, VexShape::kDstSrcRm, true, false},
+    {Code::EVEX_VPSLLW_XMM_K1Z_XMMM128_IMM8, VexShape::kDstRmImm, true, false},
+    {Code::EVEX_VPSLLW_XMM_K1Z_XMM_XMMM128, VexShape::kDstSrcRm, true, false},
+    {Code::EVEX_VPSRAD_XMM_K1Z_XMMM128B32_IMM8, VexShape::kDstRmImm, true, true},
+    {Code::EVEX_VPSRAD_XMM_K1Z_XMM_XMMM128, VexShape::kDstSrcRm, true, false},
+    {Code::EVEX_VPSRAW_XMM_K1Z_XMMM128_IMM8, VexShape::kDstRmImm, true, false},
+    {Code::EVEX_VPSRAW_XMM_K1Z_XMM_XMMM128, VexShape::kDstSrcRm, true, false},
+    {Code::EVEX_VPSRLD_XMM_K1Z_XMMM128B32_IMM8, VexShape::kDstRmImm, true, true},
+    {Code::EVEX_VPSRLD_XMM_K1Z_XMM_XMMM128, VexShape::kDstSrcRm, true, false},
+    {Code::EVEX_VPSRLQ_XMM_K1Z_XMMM128B64_IMM8, VexShape::kDstRmImm, true, true},
+    {Code::EVEX_VPSRLQ_XMM_K1Z_XMM_XMMM128, VexShape::kDstSrcRm, true, false},
+    {Code::EVEX_VPSRLW_XMM_K1Z_XMMM128_IMM8, VexShape::kDstRmImm, true, false},
+    {Code::EVEX_VPSRLW_XMM_K1Z_XMM_XMMM128, VexShape::kDstSrcRm, true, false},
+    {Code::EVEX_VPSUBB_XMM_K1Z_XMM_XMMM128, VexShape::kDstSrcRm, true, false},
+    {Code::EVEX_VPSUBD_XMM_K1Z_XMM_XMMM128B32, VexShape::kDstSrcRm, true, true},
+    {Code::EVEX_VPSUBQ_XMM_K1Z_XMM_XMMM128B64, VexShape::kDstSrcRm, true, true},
+    {Code::EVEX_VPSUBSB_XMM_K1Z_XMM_XMMM128, VexShape::kDstSrcRm, true, false},
+    {Code::EVEX_VPSUBSW_XMM_K1Z_XMM_XMMM128, VexShape::kDstSrcRm, true, false},
+    {Code::EVEX_VPSUBUSB_XMM_K1Z_XMM_XMMM128, VexShape::kDstSrcRm, true, false},
+    {Code::EVEX_VPSUBUSW_XMM_K1Z_XMM_XMMM128, VexShape::kDstSrcRm, true, false},
+    {Code::EVEX_VPSUBW_XMM_K1Z_XMM_XMMM128, VexShape::kDstSrcRm, true, false},
+    {Code::EVEX_VPUNPCKHBW_XMM_K1Z_XMM_XMMM128, VexShape::kDstSrcRm, true, false},
+    {Code::EVEX_VPUNPCKHDQ_XMM_K1Z_XMM_XMMM128B32, VexShape::kDstSrcRm, true, true},
+    {Code::EVEX_VPUNPCKHWD_XMM_K1Z_XMM_XMMM128, VexShape::kDstSrcRm, true, false},
+    {Code::EVEX_VPUNPCKLBW_XMM_K1Z_XMM_XMMM128, VexShape::kDstSrcRm, true, false},
+    {Code::EVEX_VPUNPCKLDQ_XMM_K1Z_XMM_XMMM128B32, VexShape::kDstSrcRm, true, true},
+    {Code::EVEX_VPUNPCKLWD_XMM_K1Z_XMM_XMMM128, VexShape::kDstSrcRm, true, false},
+    {Code::EVEX_VPXORD_XMM_K1Z_XMM_XMMM128B32, VexShape::kDstSrcRm, true, true},
+    {Code::EVEX_VPXORQ_XMM_K1Z_XMM_XMMM128B64, VexShape::kDstSrcRm, true, true},
+    {Code::EVEX_VSHUFPD_XMM_K1Z_XMM_XMMM128B64_IMM8, VexShape::kDstSrcRmImm, true, true},
+    {Code::EVEX_VSHUFPS_XMM_K1Z_XMM_XMMM128B32_IMM8, VexShape::kDstSrcRmImm, true, true},
+    {Code::EVEX_VUNPCKHPD_XMM_K1Z_XMM_XMMM128B64, VexShape::kDstSrcRm, true, true},
+    {Code::EVEX_VUNPCKHPS_XMM_K1Z_XMM_XMMM128B32, VexShape::kDstSrcRm, true, true},
+    {Code::EVEX_VUNPCKLPD_XMM_K1Z_XMM_XMMM128B64, VexShape::kDstSrcRm, true, true},
+    {Code::EVEX_VUNPCKLPS_XMM_K1Z_XMM_XMMM128B32, VexShape::kDstSrcRm, true, true},
+    {Code::VEX_VADDPD_XMM_XMM_XMMM128, VexShape::kDstSrcRm, false, false},
+    {Code::VEX_VADDPS_XMM_XMM_XMMM128, VexShape::kDstSrcRm, false, false},
+    {Code::VEX_VADDSD_XMM_XMM_XMMM64, VexShape::kDstSrcRm64, false, false},
+    {Code::VEX_VADDSS_XMM_XMM_XMMM32, VexShape::kDstSrcRm32, false, false},
+    {Code::VEX_VANDNPD_XMM_XMM_XMMM128, VexShape::kDstSrcRm, false, false},
+    {Code::VEX_VANDNPS_XMM_XMM_XMMM128, VexShape::kDstSrcRm, false, false},
+    {Code::VEX_VANDPD_XMM_XMM_XMMM128, VexShape::kDstSrcRm, false, false},
+    {Code::VEX_VANDPS_XMM_XMM_XMMM128, VexShape::kDstSrcRm, false, false},
+    {Code::VEX_VDIVPD_XMM_XMM_XMMM128, VexShape::kDstSrcRm, false, false},
+    {Code::VEX_VDIVPS_XMM_XMM_XMMM128, VexShape::kDstSrcRm, false, false},
+    {Code::VEX_VDIVSD_XMM_XMM_XMMM64, VexShape::kDstSrcRm64, false, false},
+    {Code::VEX_VDIVSS_XMM_XMM_XMMM32, VexShape::kDstSrcRm32, false, false},
+    {Code::VEX_VMAXPD_XMM_XMM_XMMM128, VexShape::kDstSrcRm, false, false},
+    {Code::VEX_VMAXPS_XMM_XMM_XMMM128, VexShape::kDstSrcRm, false, false},
+    {Code::VEX_VMAXSD_XMM_XMM_XMMM64, VexShape::kDstSrcRm64, false, false},
+    {Code::VEX_VMAXSS_XMM_XMM_XMMM32, VexShape::kDstSrcRm32, false, false},
+    {Code::VEX_VMINPD_XMM_XMM_XMMM128, VexShape::kDstSrcRm, false, false},
+    {Code::VEX_VMINPS_XMM_XMM_XMMM128, VexShape::kDstSrcRm, false, false},
+    {Code::VEX_VMINSD_XMM_XMM_XMMM64, VexShape::kDstSrcRm64, false, false},
+    {Code::VEX_VMINSS_XMM_XMM_XMMM32, VexShape::kDstSrcRm32, false, false},
+    {Code::VEX_VMOVAPD_XMMM128_XMM, VexShape::kRmDst, false, false},
+    {Code::VEX_VMOVAPD_XMM_XMMM128, VexShape::kDstRm, false, false},
+    {Code::VEX_VMOVAPS_XMMM128_XMM, VexShape::kRmDst, false, false},
+    {Code::VEX_VMOVAPS_XMM_XMMM128, VexShape::kDstRm, false, false},
+    {Code::VEX_VMOVDDUP_XMM_XMMM64, VexShape::kDstRm64, false, false},
+    {Code::VEX_VMOVDQA_XMMM128_XMM, VexShape::kRmDst, false, false},
+    {Code::VEX_VMOVDQA_XMM_XMMM128, VexShape::kDstRm, false, false},
+    {Code::VEX_VMOVDQU_XMMM128_XMM, VexShape::kRmDst, false, false},
+    {Code::VEX_VMOVDQU_XMM_XMMM128, VexShape::kDstRm, false, false},
+    {Code::VEX_VMOVHLPS_XMM_XMM_XMM, VexShape::kDstSrcSrc, false, false},
+    {Code::VEX_VMOVLHPS_XMM_XMM_XMM, VexShape::kDstSrcSrc, false, false},
+    {Code::VEX_VMOVQ_XMM_XMMM64, VexShape::kDstRm64, false, false},
+    {Code::VEX_VMOVSD_XMM_XMM_XMM, VexShape::kDstSrcSrc, false, false},
+    {Code::VEX_VMOVSHDUP_XMM_XMMM128, VexShape::kDstRm, false, false},
+    {Code::VEX_VMOVSLDUP_XMM_XMMM128, VexShape::kDstRm, false, false},
+    {Code::VEX_VMOVSS_XMM_XMM_XMM, VexShape::kDstSrcSrc, false, false},
+    {Code::VEX_VMOVUPD_XMMM128_XMM, VexShape::kRmDst, false, false},
+    {Code::VEX_VMOVUPD_XMM_XMMM128, VexShape::kDstRm, false, false},
+    {Code::VEX_VMOVUPS_XMMM128_XMM, VexShape::kRmDst, false, false},
+    {Code::VEX_VMOVUPS_XMM_XMMM128, VexShape::kDstRm, false, false},
+    {Code::VEX_VMULPD_XMM_XMM_XMMM128, VexShape::kDstSrcRm, false, false},
+    {Code::VEX_VMULPS_XMM_XMM_XMMM128, VexShape::kDstSrcRm, false, false},
+    {Code::VEX_VMULSD_XMM_XMM_XMMM64, VexShape::kDstSrcRm64, false, false},
+    {Code::VEX_VMULSS_XMM_XMM_XMMM32, VexShape::kDstSrcRm32, false, false},
+    {Code::VEX_VORPD_XMM_XMM_XMMM128, VexShape::kDstSrcRm, false, false},
+    {Code::VEX_VORPS_XMM_XMM_XMMM128, VexShape::kDstSrcRm, false, false},
+    {Code::VEX_VPACKSSDW_XMM_XMM_XMMM128, VexShape::kDstSrcRm, false, false},
+    {Code::VEX_VPACKSSWB_XMM_XMM_XMMM128, VexShape::kDstSrcRm, false, false},
+    {Code::VEX_VPACKUSWB_XMM_XMM_XMMM128, VexShape::kDstSrcRm, false, false},
+    {Code::VEX_VPADDB_XMM_XMM_XMMM128, VexShape::kDstSrcRm, false, false},
+    {Code::VEX_VPADDD_XMM_XMM_XMMM128, VexShape::kDstSrcRm, false, false},
+    {Code::VEX_VPADDQ_XMM_XMM_XMMM128, VexShape::kDstSrcRm, false, false},
+    {Code::VEX_VPADDSB_XMM_XMM_XMMM128, VexShape::kDstSrcRm, false, false},
+    {Code::VEX_VPADDSW_XMM_XMM_XMMM128, VexShape::kDstSrcRm, false, false},
+    {Code::VEX_VPADDUSB_XMM_XMM_XMMM128, VexShape::kDstSrcRm, false, false},
+    {Code::VEX_VPADDUSW_XMM_XMM_XMMM128, VexShape::kDstSrcRm, false, false},
+    {Code::VEX_VPADDW_XMM_XMM_XMMM128, VexShape::kDstSrcRm, false, false},
+    {Code::VEX_VPANDN_XMM_XMM_XMMM128, VexShape::kDstSrcRm, false, false},
+    {Code::VEX_VPAND_XMM_XMM_XMMM128, VexShape::kDstSrcRm, false, false},
+    {Code::VEX_VPAVGB_XMM_XMM_XMMM128, VexShape::kDstSrcRm, false, false},
+    {Code::VEX_VPAVGW_XMM_XMM_XMMM128, VexShape::kDstSrcRm, false, false},
+    {Code::VEX_VPCMPEQB_XMM_XMM_XMMM128, VexShape::kDstSrcRm, false, false},
+    {Code::VEX_VPCMPEQD_XMM_XMM_XMMM128, VexShape::kDstSrcRm, false, false},
+    {Code::VEX_VPCMPEQQ_XMM_XMM_XMMM128, VexShape::kDstSrcRm, false, false},
+    {Code::VEX_VPCMPEQW_XMM_XMM_XMMM128, VexShape::kDstSrcRm, false, false},
+    {Code::VEX_VPCMPGTB_XMM_XMM_XMMM128, VexShape::kDstSrcRm, false, false},
+    {Code::VEX_VPCMPGTD_XMM_XMM_XMMM128, VexShape::kDstSrcRm, false, false},
+    {Code::VEX_VPCMPGTQ_XMM_XMM_XMMM128, VexShape::kDstSrcRm, false, false},
+    {Code::VEX_VPCMPGTW_XMM_XMM_XMMM128, VexShape::kDstSrcRm, false, false},
+    {Code::VEX_VPMULLW_XMM_XMM_XMMM128, VexShape::kDstSrcRm, false, false},
+    {Code::VEX_VPOR_XMM_XMM_XMMM128, VexShape::kDstSrcRm, false, false},
+    {Code::VEX_VPSLLDQ_XMM_XMM_IMM8, VexShape::kDstSrcImm, false, false},
+    {Code::VEX_VPSLLD_XMM_XMM_IMM8, VexShape::kDstSrcImm, false, false},
+    {Code::VEX_VPSLLD_XMM_XMM_XMMM128, VexShape::kDstSrcRm, false, false},
+    {Code::VEX_VPSLLQ_XMM_XMM_IMM8, VexShape::kDstSrcImm, false, false},
+    {Code::VEX_VPSLLQ_XMM_XMM_XMMM128, VexShape::kDstSrcRm, false, false},
+    {Code::VEX_VPSLLW_XMM_XMM_IMM8, VexShape::kDstSrcImm, false, false},
+    {Code::VEX_VPSLLW_XMM_XMM_XMMM128, VexShape::kDstSrcRm, false, false},
+    {Code::VEX_VPSRAD_XMM_XMM_IMM8, VexShape::kDstSrcImm, false, false},
+    {Code::VEX_VPSRAD_XMM_XMM_XMMM128, VexShape::kDstSrcRm, false, false},
+    {Code::VEX_VPSRAW_XMM_XMM_IMM8, VexShape::kDstSrcImm, false, false},
+    {Code::VEX_VPSRAW_XMM_XMM_XMMM128, VexShape::kDstSrcRm, false, false},
+    {Code::VEX_VPSRLDQ_XMM_XMM_IMM8, VexShape::kDstSrcImm, false, false},
+    {Code::VEX_VPSRLD_XMM_XMM_IMM8, VexShape::kDstSrcImm, false, false},
+    {Code::VEX_VPSRLD_XMM_XMM_XMMM128, VexShape::kDstSrcRm, false, false},
+    {Code::VEX_VPSRLQ_XMM_XMM_IMM8, VexShape::kDstSrcImm, false, false},
+    {Code::VEX_VPSRLQ_XMM_XMM_XMMM128, VexShape::kDstSrcRm, false, false},
+    {Code::VEX_VPSRLW_XMM_XMM_IMM8, VexShape::kDstSrcImm, false, false},
+    {Code::VEX_VPSRLW_XMM_XMM_XMMM128, VexShape::kDstSrcRm, false, false},
+    {Code::VEX_VPSUBB_XMM_XMM_XMMM128, VexShape::kDstSrcRm, false, false},
+    {Code::VEX_VPSUBD_XMM_XMM_XMMM128, VexShape::kDstSrcRm, false, false},
+    {Code::VEX_VPSUBQ_XMM_XMM_XMMM128, VexShape::kDstSrcRm, false, false},
+    {Code::VEX_VPSUBSB_XMM_XMM_XMMM128, VexShape::kDstSrcRm, false, false},
+    {Code::VEX_VPSUBSW_XMM_XMM_XMMM128, VexShape::kDstSrcRm, false, false},
+    {Code::VEX_VPSUBUSB_XMM_XMM_XMMM128, VexShape::kDstSrcRm, false, false},
+    {Code::VEX_VPSUBUSW_XMM_XMM_XMMM128, VexShape::kDstSrcRm, false, false},
+    {Code::VEX_VPSUBW_XMM_XMM_XMMM128, VexShape::kDstSrcRm, false, false},
+    {Code::VEX_VPUNPCKHBW_XMM_XMM_XMMM128, VexShape::kDstSrcRm, false, false},
+    {Code::VEX_VPUNPCKHDQ_XMM_XMM_XMMM128, VexShape::kDstSrcRm, false, false},
+    {Code::VEX_VPUNPCKHWD_XMM_XMM_XMMM128, VexShape::kDstSrcRm, false, false},
+    {Code::VEX_VPUNPCKLBW_XMM_XMM_XMMM128, VexShape::kDstSrcRm, false, false},
+    {Code::VEX_VPUNPCKLDQ_XMM_XMM_XMMM128, VexShape::kDstSrcRm, false, false},
+    {Code::VEX_VPUNPCKLWD_XMM_XMM_XMMM128, VexShape::kDstSrcRm, false, false},
+    {Code::VEX_VPXOR_XMM_XMM_XMMM128, VexShape::kDstSrcRm, false, false},
+    {Code::VEX_VSHUFPD_XMM_XMM_XMMM128_IMM8, VexShape::kDstSrcRmImm, false, false},
+    {Code::VEX_VSHUFPS_XMM_XMM_XMMM128_IMM8, VexShape::kDstSrcRmImm, false, false},
+    {Code::VEX_VSQRTSD_XMM_XMM_XMMM64, VexShape::kDstSrcRm64, false, false},
+    {Code::VEX_VSQRTSS_XMM_XMM_XMMM32, VexShape::kDstSrcRm32, false, false},
+    {Code::VEX_VSUBPD_XMM_XMM_XMMM128, VexShape::kDstSrcRm, false, false},
+    {Code::VEX_VSUBPS_XMM_XMM_XMMM128, VexShape::kDstSrcRm, false, false},
+    {Code::VEX_VSUBSD_XMM_XMM_XMMM64, VexShape::kDstSrcRm64, false, false},
+    {Code::VEX_VSUBSS_XMM_XMM_XMMM32, VexShape::kDstSrcRm32, false, false},
+    {Code::VEX_VUNPCKHPD_XMM_XMM_XMMM128, VexShape::kDstSrcRm, false, false},
+    {Code::VEX_VUNPCKHPS_XMM_XMM_XMMM128, VexShape::kDstSrcRm, false, false},
+    {Code::VEX_VUNPCKLPD_XMM_XMM_XMMM128, VexShape::kDstSrcRm, false, false},
+    {Code::VEX_VUNPCKLPS_XMM_XMM_XMMM128, VexShape::kDstSrcRm, false, false},
+    {Code::VEX_VXORPD_XMM_XMM_XMMM128, VexShape::kDstSrcRm, false, false},
+    {Code::VEX_VXORPS_XMM_XMM_XMMM128, VexShape::kDstSrcRm, false, false},
+}};
+
+[[nodiscard]] std::optional<Instruction> gen_vex_simd(Ctx& c) {
+  const fuzz::HostCaps& caps = fuzz::host_caps();
+  if (!caps.avx || !caps.avx2) return std::nullopt;
+  const bool evex_ok = caps.avx512f && caps.avx512vl && caps.avx512bw && caps.avx512dq;
+
+  // None of these write EFLAGS. The VEX forms of COMISS and friends do, but they land in the
+  // kDstRm shapes below and are handled by the flags_mask assignment after the pick.
+  c.flags_mask = 0;
+
+  // A host without AVX-512 leaves roughly a third of the table unusable, so retry rather than
+  // discard the iteration outright.
+  const VexEntry* entry = nullptr;
+  for (int attempt = 0; attempt < 8 && entry == nullptr; ++attempt) {
+    const VexEntry& candidate =
+        kVexSimd[static_cast<std::size_t>(rand_int(c.rng, 0, static_cast<int>(kVexSimd.size()) - 1))];
+    if (candidate.evex && !evex_ok) continue;
+    entry = &candidate;
+  }
+  if (entry == nullptr) return std::nullopt;
+
+  const Code code = entry->code;
+  const int d = pick_xmm_index(c.rng);
+  const int s1 = pick_xmm_index(c.rng);
+  const int s2 = pick_xmm_index(c.rng);
+  const bool use_mem = rand_int(c.rng, 0, 3) == 0;
+  const bool broadcast = use_mem && entry->broadcast && rand_int(c.rng, 0, 2) == 0;
+
+  // Set on the instruction rather than the operand: EVEX.b is a prefix bit, and iced picks the
+  // element size out of the code's own memory size once it is set.
+  const auto finish = [broadcast](Instruction instr) {
+    if (broadcast) instr.set_is_broadcast(true);
+    return instr;
+  };
+
+  switch (entry->shape) {
+    case VexShape::kDstSrcRm:
+    case VexShape::kDstSrcRm64:
+    case VexShape::kDstSrcRm32:
+      if (use_mem) {
+        c.touches_memory = true;
+        return finish(InstructionFactory::with3(code, xmm_of(d), xmm_of(s1), mem_operand(random_disp8(c.rng))));
+      }
+      return InstructionFactory::with3(code, xmm_of(d), xmm_of(s1), xmm_of(s2));
+
+    case VexShape::kDstRm:
+    case VexShape::kDstRm64:
+      if (use_mem) {
+        c.touches_memory = true;
+        return finish(InstructionFactory::with2(code, xmm_of(d), mem_operand(random_disp8(c.rng))));
+      }
+      return InstructionFactory::with2(code, xmm_of(d), xmm_of(s1));
+
+    case VexShape::kRmDst:
+      if (use_mem) {
+        c.touches_memory = true;
+        return InstructionFactory::with2(code, mem_operand(random_disp8(c.rng)), xmm_of(s1));
+      }
+      return InstructionFactory::with2(code, xmm_of(d), xmm_of(s1));
+
+    case VexShape::kDstSrcSrc:
+      return InstructionFactory::with3(code, xmm_of(d), xmm_of(s1), xmm_of(s2));
+
+    case VexShape::kDstSrcImm: {
+      const auto imm = static_cast<std::int32_t>(random_imm(c.rng, 8));
+      auto instr = InstructionFactory::with3(code, xmm_of(d), xmm_of(s1), imm);
+      set_imm8(instr, 2, static_cast<std::uint64_t>(imm));
+      return instr;
+    }
+
+    case VexShape::kDstSrcRmImm: {
+      const auto imm = static_cast<std::int32_t>(random_imm(c.rng, 8));
+      if (use_mem) {
+        c.touches_memory = true;
+        auto instr = InstructionFactory::with4(code, xmm_of(d), xmm_of(s1), mem_operand(random_disp8(c.rng)), imm);
+        set_imm8(instr, 3, static_cast<std::uint64_t>(imm));
+        return finish(instr);
+      }
+      auto instr = InstructionFactory::with4(code, xmm_of(d), xmm_of(s1), xmm_of(s2), imm);
+      set_imm8(instr, 3, static_cast<std::uint64_t>(imm));
+      return instr;
+    }
+
+    case VexShape::kDstRmImm: {
+      const auto imm = static_cast<std::int32_t>(random_imm(c.rng, 8));
+      if (use_mem) {
+        c.touches_memory = true;
+        auto instr = InstructionFactory::with3(code, xmm_of(d), mem_operand(random_disp8(c.rng)), imm);
+        set_imm8(instr, 2, static_cast<std::uint64_t>(imm));
+        return instr;
+      }
+      auto instr = InstructionFactory::with3(code, xmm_of(d), xmm_of(s1), imm);
+      set_imm8(instr, 2, static_cast<std::uint64_t>(imm));
+      return instr;
+    }
+  }
+  return std::nullopt;
+}
+
 // ------------------------------------------------- exchange / double-shift
 
 // The read-modify-write trio. XCHG against memory carries an implicit LOCK, and all three have a
@@ -1971,7 +2326,7 @@ constexpr std::array<Code, 8> kX87Transcendental = {
 // -------------------------------------------------------------- dispatch
 
 using GenFn = std::optional<Instruction> (*)(Ctx&);
-constexpr std::array<GenFn, 46> kFamilies = {
+constexpr std::array<GenFn, 47> kFamilies = {
     gen_alu, gen_test, gen_unary, gen_shift, gen_mov, gen_movx, gen_movsxd,
     gen_pushpop, gen_lea, gen_jcc, gen_jmp, gen_call, gen_ret, gen_setcc,
     gen_cmovcc, gen_bt, gen_rmsrc, gen_bswap,
@@ -1979,7 +2334,7 @@ constexpr std::array<GenFn, 46> kFamilies = {
     gen_string_ops,
     gen_bmi,
     gen_muldiv, gen_imul_multi,
-    gen_simd_shuffle, gen_simd_logic, gen_simd_pack, gen_simd_shift, gen_simd_fp,
+    gen_simd_shuffle, gen_simd_logic, gen_simd_pack, gen_simd_shift, gen_simd_fp,        gen_vex_simd,
     gen_sse_arith, gen_packed_int, gen_sse_move,
     gen_privileged, gen_privileged_movcrdr,
     gen_x87_load, gen_x87_store, gen_x87_arith, gen_x87_unary, gen_x87_compare, gen_x87_move,

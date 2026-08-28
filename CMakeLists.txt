@@ -195,6 +195,7 @@ endif()
 
 add_executable(seven_fuzzer
   src/main.cpp
+  src/common/host_caps.cpp
   src/lanes/seven_lane.cpp
   src/lanes/seven_jit_lane.cpp
   src/lanes/unicorn_lane.cpp

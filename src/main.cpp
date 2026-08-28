@@ -51,6 +51,7 @@
 #include <thread>
 #include <vector>
 
+#include "common/host_caps.hpp"
 #include "common/types.hpp"
 #include "gen/instruction_gen.hpp"
 #include "lanes/hardware_lane.hpp"
@@ -789,6 +790,10 @@ int main(int argc, char** argv) {
   std::printf("seven-fuzzer: iterations=%llu seed=0x%llX hw=%s engine=%s threads=%u\n",
               static_cast<unsigned long long>(iterations), static_cast<unsigned long long>(seed),
               use_hw ? "on" : "off", use_jit ? "seven-jit" : "seven", threads);
+  // The VEX/EVEX families are only generated on a host whose silicon can adjudicate them, so two
+  // runs of the same seed on different machines can cover different instruction sets. Printing it
+  // means a log says which one it was rather than leaving it to be guessed later.
+  std::printf("seven-fuzzer: host simd = %s\n", fuzz::host_caps().summary().c_str());
   std::fflush(stdout);
 
   if (watchdog_seconds != 0) {
