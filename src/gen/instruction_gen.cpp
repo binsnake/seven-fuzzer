@@ -1541,15 +1541,11 @@ constexpr std::array<SseMoveForm, 15> kSseMoveStore = {{
 
 // ------------------------------------------------------- privileged (ring 0)
 //
-// NOT wired into kFamilies below -- excluded from generation pending a real
-// decision on whether seven should model CPL/rings at all. Every one of
-// these deterministically #GPs on real hardware in ring 3, but seven (like
-// Unicorn) executes them unconditionally, with no privilege-level concept
-// at all. That's not a scattered bug like the earlier findings -- every
-// single test case hits the identical "ok vs gp" pattern, which just
-// dilutes a fuzzing run without producing new information once the pattern
-// is understood. Left implemented here (not deleted) so it's a one-line
-// re-add to kFamilies once there's an answer -- see project notes.
+// These were held out of kFamilies for a long time because seven had no concept of a privilege
+// level, so every one of them produced the same uninformative "seven ran it, hardware #GP'd"
+// mismatch. Seven models CPL now (it reads the CS selector's low two bits) and the lanes set
+// CS to a ring-3 selector to match the hardware lane, so these finally compare something real:
+// they are the only coverage the privilege gates have against actual silicon.
 
 // Every one of these deterministically #GPs in our ring-3 sandbox before
 // doing anything real -- see project notes (Hardware Lane Safety) for why
@@ -1594,7 +1590,7 @@ constexpr std::array<SseMoveForm, 15> kSseMoveStore = {{
 // -------------------------------------------------------------- dispatch
 
 using GenFn = std::optional<Instruction> (*)(Ctx&);
-constexpr std::array<GenFn, 36> kFamilies = {
+constexpr std::array<GenFn, 38> kFamilies = {
     gen_alu, gen_test, gen_unary, gen_shift, gen_mov, gen_movx, gen_movsxd,
     gen_pushpop, gen_lea, gen_jcc, gen_jmp, gen_call, gen_ret, gen_setcc,
     gen_cmovcc, gen_bt, gen_rmsrc, gen_bswap,
@@ -1604,8 +1600,7 @@ constexpr std::array<GenFn, 36> kFamilies = {
     gen_muldiv, gen_imul_multi,
     gen_simd_shuffle, gen_simd_logic, gen_simd_pack, gen_simd_shift, gen_simd_fp,
     gen_sse_arith, gen_packed_int, gen_sse_move,
-    // gen_privileged / gen_privileged_movcrdr: intentionally excluded, see
-    // the comment above their definitions.
+    gen_privileged, gen_privileged_movcrdr,
 };
 
 [[nodiscard]] std::string hex_dump(const std::vector<std::uint8_t>& b) {

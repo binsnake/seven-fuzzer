@@ -67,6 +67,11 @@ LaneOutcome run_seven(const TestCase& tc) {
   m.state.mode = seven::ExecutionMode::long64;
   m.state.rip = kCodeBase;
   m.state.rflags = tc.initial.rflags;
+  // CPL comes from the CS selector's low two bits, and the hardware lane is a real ring-3 Windows
+  // thread. Leaving this zero told seven it was ring 0 while the oracle it is compared against was
+  // ring 3, so every privileged instruction disagreed by construction and the whole class had to be
+  // kept out of the corpus. 0x33 is the usual long-mode user CS.
+  m.state.sreg[1] = 0x33;
   m.state.gpr = tc.initial.gpr;
   for (int i = 0; i < 16; ++i) {
     m.state.vectors[static_cast<std::size_t>(i)].value =

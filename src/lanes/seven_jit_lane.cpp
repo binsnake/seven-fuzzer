@@ -71,6 +71,7 @@ LaneOutcome run_seven_jit(const TestCase& tc, seven_jit::JitExecutor& jit_execut
   state.mode = seven::ExecutionMode::long64;
   state.rip = kCodeBase;
   state.rflags = tc.initial.rflags;
+  state.sreg[1] = 0x33;  // ring 3, same as the seven lane and the hardware lane
   state.gpr = tc.initial.gpr;
   for (int i = 0; i < 16; ++i) {
     state.vectors[static_cast<std::size_t>(i)].value =
