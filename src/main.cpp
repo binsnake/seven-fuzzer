@@ -206,6 +206,41 @@ void diff_pair(const char* label, const LaneOutcome& a, const LaneOutcome& b, st
       d.lines.emplace_back(buf);
     }
     if (a.after.data_after != b.after.data_after) d.lines.emplace_back("data window differs");
+    if (a.captures_x87 && b.captures_x87) {
+      const X87State& xa = a.after.x87;
+      const X87State& xb = b.after.x87;
+      if (xa.control_word != xb.control_word) {
+        std::snprintf(buf, sizeof(buf), "x87 cw: %04X vs %04X", xa.control_word, xb.control_word);
+        d.lines.emplace_back(buf);
+      }
+      const std::uint16_t sa = xa.status_word & kX87StatusMask;
+      const std::uint16_t sb = xb.status_word & kX87StatusMask;
+      if (sa != sb) {
+        // The differing bits are spelled out because triaging an x87 status word by eye is
+        // otherwise a bit-picking exercise every single time -- a run where only bit 5 (PE) ever
+        // differs is a very different conclusion from one where TOP does.
+        std::snprintf(buf, sizeof(buf), "x87 sw: %04X vs %04X (differing bits %04X)", sa, sb,
+                      static_cast<unsigned>(sa ^ sb));
+        d.lines.emplace_back(buf);
+      }
+      if (xa.tag_word != xb.tag_word) {
+        std::snprintf(buf, sizeof(buf), "x87 tw: %04X vs %04X", xa.tag_word, xb.tag_word);
+        d.lines.emplace_back(buf);
+      }
+      for (int i = 0; i < 8; ++i) {
+        // An empty x87 register's contents are architecturally undefined -- a pop marks the slot
+        // free without specifying what is left behind in it -- so only compare slots both engines
+        // agree are live. Same principle as gpr_compare_mask for BSF/BSR's zero-source destination.
+        if (x87_tag_of_st(xa, i) == 0x3 || x87_tag_of_st(xb, i) == 0x3) continue;
+        const auto ii = static_cast<std::size_t>(i);
+        if (xa.signexp[ii] != xb.signexp[ii] || xa.signif[ii] != xb.signif[ii]) {
+          std::snprintf(buf, sizeof(buf), "st%d: %04X:%016llX vs %04X:%016llX", i, xa.signexp[ii],
+                        static_cast<unsigned long long>(xa.signif[ii]), xb.signexp[ii],
+                        static_cast<unsigned long long>(xb.signif[ii]));
+          d.lines.emplace_back(buf);
+        }
+      }
+    }
   }
   if (!d.lines.empty()) out.push_back(std::move(d));
 }

@@ -36,6 +36,41 @@ void unpack_xmm(const seven::SimdUint& value, std::uint64_t& lo, std::uint64_t& 
   std::memcpy(&hi, bytes.data() + 8, 8);
 }
 
+// seven holds the x87 stack in PHYSICAL registers R0..R7 and resolves ST(i) through TOP; sf's
+// X87State is stack-relative (see its comment). These two rotate between the conventions. TOP has
+// to be established first, via set_x87_status_word, because that is what the rotation is relative
+// to.
+void apply_x87(seven::CpuState& state, const X87State& x) {
+  state.set_x87_control_word(x.control_word);
+  state.set_x87_status_word(x.status_word);
+  const int top = static_cast<int>(state.get_x87_top());
+  for (int i = 0; i < 8; ++i) {
+    const auto phys = static_cast<std::size_t>((top + i) & 0x7);
+    state.x87_stack[phys].val.signif = x.signif[static_cast<std::size_t>(i)];
+    state.x87_stack[phys].val.signExp = x.signexp[static_cast<std::size_t>(i)];
+  }
+  for (int phys = 0; phys < 8; ++phys) {
+    state.x87_tags[static_cast<std::size_t>(phys)] = static_cast<std::uint8_t>((x.tag_word >> (2 * phys)) & 0x3u);
+  }
+}
+
+void read_x87(const seven::CpuState& state, X87State& x) {
+  x.control_word = state.get_x87_control_word();
+  x.status_word = state.get_x87_status_word();
+  const int top = static_cast<int>(state.get_x87_top());
+  for (int i = 0; i < 8; ++i) {
+    const auto phys = static_cast<std::size_t>((top + i) & 0x7);
+    x.signif[static_cast<std::size_t>(i)] = state.x87_stack[phys].val.signif;
+    x.signexp[static_cast<std::size_t>(i)] = state.x87_stack[phys].val.signExp;
+  }
+  std::uint16_t tw = 0;
+  for (int phys = 0; phys < 8; ++phys) {
+    tw |= static_cast<std::uint16_t>(static_cast<std::uint16_t>(state.x87_tags[static_cast<std::size_t>(phys)] & 0x3u)
+                                      << (2 * phys));
+  }
+  x.tag_word = tw;
+}
+
 [[nodiscard]] Stop map_stop_reason(seven::StopReason r) noexcept {
   using SR = seven::StopReason;
   switch (r) {
@@ -77,6 +112,7 @@ LaneOutcome run_seven(const TestCase& tc) {
     m.state.vectors[static_cast<std::size_t>(i)].value =
         pack_xmm(tc.initial.xmm_lo[static_cast<std::size_t>(i)], tc.initial.xmm_hi[static_cast<std::size_t>(i)]);
   }
+  apply_x87(m.state, tc.initial.x87);
 
   // All three scratch pages RWX in every lane so permission mismatches never
   // masquerade as execution-semantics differences.
@@ -113,6 +149,8 @@ LaneOutcome run_seven(const TestCase& tc) {
     unpack_xmm(m.state.vectors[static_cast<std::size_t>(i)].value, out.after.xmm_lo[static_cast<std::size_t>(i)],
                out.after.xmm_hi[static_cast<std::size_t>(i)]);
   }
+  read_x87(m.state, out.after.x87);
+  out.captures_x87 = true;
   (void)m.memory.read(kDataBase, out.after.data_after.data(), kDataWindow);
 
   return out;

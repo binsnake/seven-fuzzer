@@ -43,6 +43,53 @@ void apply_context_to_xmm(CONTEXT& ctx, const RegState& r) {
   }
 }
 
+// FltSave is the raw FXSAVE legacy area, so FloatRegisters[i] is ST(i) (stack-relative) and
+// TagWord is the abridged 8-bit form indexed by PHYSICAL register. Both were confirmed on this
+// host rather than taken from the manual: FNINIT/FLDZ/FLD1 leaves TOP=6, and the resulting image
+// had 1.0 in FloatRegisters[0] with TagWord 0x00C0 (bits 6 and 7, the two physical registers in
+// use). See X87State's comment for which of the two forms the comparison is done in.
+void apply_context_to_x87(CONTEXT& ctx, const RegState& r) {
+  ctx.FltSave.ControlWord = r.x87.control_word;
+  ctx.FltSave.StatusWord = r.x87.status_word;
+  std::uint8_t abridged = 0;
+  for (int phys = 0; phys < 8; ++phys) {
+    if (((r.x87.tag_word >> (2 * phys)) & 0x3u) != 0x3u) abridged |= static_cast<std::uint8_t>(1u << phys);
+  }
+  ctx.FltSave.TagWord = abridged;
+  for (int i = 0; i < 8; ++i) {
+    auto* slot = reinterpret_cast<std::uint8_t*>(&ctx.FltSave.FloatRegisters[i]);
+    std::memset(slot, 0, sizeof(M128A));
+    const std::uint64_t signif = r.x87.signif[static_cast<std::size_t>(i)];
+    const std::uint16_t signexp = r.x87.signexp[static_cast<std::size_t>(i)];
+    std::memcpy(slot, &signif, sizeof(signif));
+    std::memcpy(slot + 8, &signexp, sizeof(signexp));
+  }
+}
+
+void read_x87_from_context(const CONTEXT& ctx, RegState& r) {
+  r.x87.control_word = ctx.FltSave.ControlWord;
+  r.x87.status_word = ctx.FltSave.StatusWord;
+  for (int i = 0; i < 8; ++i) {
+    const auto* slot = reinterpret_cast<const std::uint8_t*>(&ctx.FltSave.FloatRegisters[i]);
+    std::memcpy(&r.x87.signif[static_cast<std::size_t>(i)], slot, 8);
+    std::memcpy(&r.x87.signexp[static_cast<std::size_t>(i)], slot + 8, 2);
+  }
+  // Expand the abridged byte into the architectural two-bits-per-register word, which needs the
+  // register contents as well as the in-use bit. Note the byte is physical-order while the
+  // registers just read above are stack-relative, so this walks TOP the other way.
+  const auto top = static_cast<int>((ctx.FltSave.StatusWord >> 11) & 0x7u);
+  std::uint16_t full = 0;
+  for (int phys = 0; phys < 8; ++phys) {
+    std::uint8_t tag = 0x3;
+    if (((ctx.FltSave.TagWord >> phys) & 1u) != 0) {
+      const int st = (phys - top) & 0x7;
+      tag = x87_classify_tag(r.x87.signexp[static_cast<std::size_t>(st)], r.x87.signif[static_cast<std::size_t>(st)]);
+    }
+    full |= static_cast<std::uint16_t>(static_cast<std::uint16_t>(tag) << (2 * phys));
+  }
+  r.x87.tag_word = full;
+}
+
 void read_xmm_from_context(const CONTEXT& ctx, RegState& r) {
   for (int i = 0; i < 16; ++i) {
     r.xmm_lo[static_cast<std::size_t>(i)] = ctx.FltSave.XmmRegisters[i].Low;
@@ -375,6 +422,11 @@ struct HardwareSession::Impl {
     }
     apply_context_to_gpr(ctx, tc.initial);
     apply_context_to_xmm(ctx, tc.initial);
+    // The victim process is reused across test cases and the FPU is the one piece of state that
+    // survives a test case entirely on its own (stack contents, TOP, sticky exception flags), so
+    // this is a reset as much as it is a setup: without it an FLD from case N would still be on
+    // the stack when case N+1's FADD ran.
+    apply_context_to_x87(ctx, tc.initial);
     ctx.Rip = kCodeBase;
     // Force TF (single-step) and reserved bit 1; strip everything the
     // generator doesn't own so a stray bit can't destabilize the victim.
@@ -488,6 +540,8 @@ struct HardwareSession::Impl {
           if (GetThreadContext(thread, &after)) {
             read_gpr_from_context(after, out.after);
             read_xmm_from_context(after, out.after);
+            read_x87_from_context(after, out.after);
+            out.captures_x87 = true;
           }
           SIZE_T got = 0;
           ReadProcessMemory(process, reinterpret_cast<LPCVOID>(kDataBase), out.after.data_after.data(),

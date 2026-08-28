@@ -1,6 +1,7 @@
 #include "lanes/unicorn_lane.hpp"
 
 #include <array>
+#include <cstring>
 #include <string>
 
 #include <unicorn/unicorn.h>
@@ -130,6 +131,27 @@ LaneOutcome run_unicorn(const TestCase& tc) {
     if ((err = uc_reg_write(uc, kXmmRegIds[static_cast<std::size_t>(i)], v)) != UC_ERR_OK) {
       return fail("xmm write", err);
     }
+  }
+
+  // Write-only: this lane sets the x87 state so an x87 test case's GPR and memory results (FNSTSW
+  // AX, FSTP m64, ...) stay comparable, but LaneOutcome::captures_x87 stays false and the register
+  // file is never read back. See that field's comment. FPSW goes first because Unicorn derives its
+  // TOP from it, and UC_X86_REG_ST0..ST7 are stack-relative (UC_X86_REG_FP0..FP7 are the physical
+  // ones), so the order below matters. FPTAG takes the full architectural word, same form X87State
+  // carries.
+  {
+    std::uint16_t sw = tc.initial.x87.status_word;
+    if ((err = uc_reg_write(uc, UC_X86_REG_FPSW, &sw)) != UC_ERR_OK) return fail("fpsw write", err);
+    std::uint16_t cw = tc.initial.x87.control_word;
+    if ((err = uc_reg_write(uc, UC_X86_REG_FPCW, &cw)) != UC_ERR_OK) return fail("fpcw write", err);
+    for (int i = 0; i < 8; ++i) {
+      std::uint8_t raw[10] = {};
+      std::memcpy(raw, &tc.initial.x87.signif[static_cast<std::size_t>(i)], 8);
+      std::memcpy(raw + 8, &tc.initial.x87.signexp[static_cast<std::size_t>(i)], 2);
+      if ((err = uc_reg_write(uc, UC_X86_REG_ST0 + i, raw)) != UC_ERR_OK) return fail("st write", err);
+    }
+    std::uint16_t tw = tc.initial.x87.tag_word;
+    if ((err = uc_reg_write(uc, UC_X86_REG_FPTAG, &tw)) != UC_ERR_OK) return fail("fptag write", err);
   }
 
   // See hook_intr's comment: without this, every CPU-raised exception (divide error, #GP, ...)

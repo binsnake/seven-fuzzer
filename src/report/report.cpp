@@ -8,6 +8,22 @@ namespace sf {
 
 namespace {
 
+// ST slots are printed with their tag so a reader can tell "this register holds that encoding"
+// from "this register is empty and whatever is printed here means nothing".
+void append_x87(std::string& out, const char* indent, const X87State& x) {
+  char buf[192];
+  std::snprintf(buf, sizeof(buf), "%sx87 cw=%04X sw=%04X (top=%u) tw=%04X\n", indent, x.control_word, x.status_word,
+                static_cast<unsigned>(x87_top_of(x)), x.tag_word);
+  out += buf;
+  static const char* kTagName[4] = {"valid", "zero", "spec", "empty"};
+  for (int i = 0; i < 8; ++i) {
+    const auto ii = static_cast<std::size_t>(i);
+    std::snprintf(buf, sizeof(buf), "%s  st%d=%04X:%016llX %s\n", indent, i, x.signexp[ii],
+                  static_cast<unsigned long long>(x.signif[ii]), kTagName[x87_tag_of_st(x, i)]);
+    out += buf;
+  }
+}
+
 void append_outcome(std::string& out, const char* label, const LaneOutcome& o) {
   char buf[256];
   out += std::string("[") + label + "]\n";
@@ -36,6 +52,11 @@ void append_outcome(std::string& out, const char* label, const LaneOutcome& o) {
                   static_cast<unsigned long long>(o.after.xmm_hi[static_cast<std::size_t>(i)]),
                   static_cast<unsigned long long>(o.after.xmm_lo[static_cast<std::size_t>(i)]));
     out += buf;
+  }
+  if (o.captures_x87) {
+    append_x87(out, "  ", o.after.x87);
+  } else {
+    out += "  x87 (not captured by this lane)\n";
   }
 }
 
@@ -69,6 +90,23 @@ std::string write_finding(const std::string& findings_dir, int index, const Test
                   static_cast<unsigned long long>(tc.initial.xmm_hi[static_cast<std::size_t>(i)]),
                   static_cast<unsigned long long>(tc.initial.xmm_lo[static_cast<std::size_t>(i)]));
     out += buf;
+  }
+  append_x87(out, "  ", tc.initial.x87);
+  // The scratch page's starting contents used to be left out of findings entirely, which was
+  // survivable while memory operands were only ever integers the flags told you about. An x87
+  // memory source is the whole operand -- an FLD m80 finding is unreadable, and unreproducible by
+  // hand, without the ten bytes it loaded.
+  if (tc.touches_memory) {
+    out += "  data_seed:\n";
+    for (std::size_t row = 0; row < tc.data_seed.size(); row += 32) {
+      std::snprintf(buf, sizeof(buf), "    %03zX:", row);
+      out += buf;
+      for (std::size_t col = 0; col < 32 && row + col < tc.data_seed.size(); ++col) {
+        std::snprintf(buf, sizeof(buf), " %02X", tc.data_seed[row + col]);
+        out += buf;
+      }
+      out += "\n";
+    }
   }
   out += "\n";
 

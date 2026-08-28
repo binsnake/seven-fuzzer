@@ -98,6 +98,20 @@ struct Ctx {
     std::uint64_t value;
   };
   std::optional<ForcedQword> force_data_qword;
+  // Same idea, any width up to the 10 bytes an m80 operand needs. The x87 memory forms need it
+  // because a uniformly random 4/8/10-byte pattern reads as a NaN or an unnormal nearly every
+  // time, and the ordinary finite values are where the rounding paths actually get exercised.
+  struct ForcedBytes {
+    std::size_t offset;
+    std::size_t size;
+    std::array<std::uint8_t, 10> value;
+  };
+  std::optional<ForcedBytes> force_data_bytes;
+  // Set by the x87 families. next() then builds a whole starting FPU state -- stack contents, TOP,
+  // tags, control word -- instead of leaving the default empty stack that every one of them would
+  // otherwise just underflow straight through.
+  bool uses_x87 = false;
+  int x87_needs = 0;  // ST slots the instruction reads; see next() for how the stack depth is picked
 };
 
 [[nodiscard]] int rand_int(std::mt19937_64& rng, int lo, int hi) {
@@ -1587,10 +1601,377 @@ constexpr std::array<SseMoveForm, 15> kSseMoveStore = {{
                    : InstructionFactory::with2(Code::MOV_DR_R64, drreg, reg_of(Width::W64, gp));
 }
 
+// ------------------------------------------------------------------- x87
+//
+// Two things about the FPU environment are deliberately pinned rather than randomized:
+//
+//   * All six exception masks stay SET (FCW[5:0] = 0x3F). An unmasked x87 exception does not fault
+//     on the instruction that raised it -- the #MF is deferred to the next non-control x87
+//     instruction -- so in a single-step harness it would either never fire at all or fire inside a
+//     completely unrelated later test case, since the hardware lane's victim process is shared.
+//     Masked is also the only mode in which every operation still produces a defined result to
+//     compare instead of leaving its destination untouched.
+//   * Precision control stays at extended (FCW[9:8] = 3). seven has no precision-control handling
+//     anywhere, so randomizing it would turn every arithmetic case into the same single known
+//     divergence rather than finding anything new.
+//
+// Rounding control IS randomized across all four modes -- that path is new and nothing else
+// validates it against silicon.
+//
+// Left out on purpose, see project notes: FNSTENV/FNSAVE (seven documents FIP/FCS/FDP/FDS as
+// permanently zero, so the stored image differs from hardware's on every single case and says
+// nothing new), FLDENV/FRSTOR (they load a guest-controlled control word out of the random scratch
+// page, which can unmask an exception mid-run and defer an #MF into a later test case), FXSAVE/
+// FXRSTOR (a 512-byte image does not fit the 256-byte compared window), FBLD/FBSTP (random bytes
+// are not valid packed BCD and the result of feeding invalid digits is undefined), and FICOM/
+// FICOMP (absent from seven's handled-code table entirely -- an unimplemented opcode, not a
+// semantics question a fuzzer answers).
+//
+// One shape below IS generated but is not comparable when it happens to come up, and there is no
+// way to know that before running it: FPREM/FPREM1 with an exponent difference of 64 or more reduce
+// by an implementation-defined number of bits (the SDM only pins it to "between 32 and 63") and
+// report the result as incomplete via C2. Two engines choosing differently there are both correct,
+// so read a C2-set FPREM/FPREM1 finding as noise unless something besides ST(0) also differs.
+
+constexpr std::array<Register, 8> kRegsSt = {
+    Register::ST0, Register::ST1, Register::ST2, Register::ST3,
+    Register::ST4, Register::ST5, Register::ST6, Register::ST7,
+};
+
+[[nodiscard]] Register st_of(int idx) { return kRegsSt[static_cast<std::size_t>(idx)]; }
+
+struct X87Raw {
+  std::uint16_t signexp;
+  std::uint64_t signif;
+};
+
+// Includes the four encodings that exist only in this format -- pseudo-NaN, pseudo-infinity,
+// unnormal, pseudo-denormal -- which no f32/f64 operand pool can reach, and which hardware treats
+// as a class of their own rather than as NaNs or normals.
+constexpr std::array<X87Raw, 24> kX87Pool = {{
+    {0x0000, 0x0000000000000000ull},  // +0
+    {0x8000, 0x0000000000000000ull},  // -0
+    {0x3FFF, 0x8000000000000000ull},  // +1
+    {0xBFFF, 0x8000000000000000ull},  // -1
+    {0x4000, 0x8000000000000000ull},  // +2
+    {0x4000, 0xC000000000000000ull},  // +3
+    {0x4002, 0xA000000000000000ull},  // +10
+    {0x400B, 0xB400000000000000ull},  // +5760, an exact integer FRNDINT/FIST round-trip
+    {0x7FFF, 0x8000000000000000ull},  // +inf
+    {0xFFFF, 0x8000000000000000ull},  // -inf
+    {0x7FFF, 0xC000000000000000ull},  // QNaN
+    {0xFFFF, 0xC000000000000000ull},  // the real indefinite, i.e. the masked-#IA result itself
+    {0x7FFF, 0x8000000000000001ull},  // SNaN
+    {0x7FFF, 0x4000000000000000ull},  // pseudo-NaN, integer bit clear
+    {0x7FFF, 0x0000000000000000ull},  // pseudo-infinity
+    {0x4000, 0x4000000000000000ull},  // unnormal
+    {0x0000, 0x8000000000000000ull},  // pseudo-denormal, integer bit set at exponent 0
+    {0x0000, 0x0000000000000001ull},  // smallest denormal
+    {0x0000, 0x7FFFFFFFFFFFFFFFull},  // largest denormal
+    {0x0001, 0x8000000000000000ull},  // smallest normal
+    {0x7FFE, 0xFFFFFFFFFFFFFFFFull},  // largest normal
+    {0x3FFF, 0xC90FDAA22168C235ull},  // pi/2, where the trig argument reduction turns over
+    {0x403E, 0x8000000000000000ull},  // 2^63, where the trig operand range check starts rejecting
+    {0x4040, 0x8000000000000000ull},  // 2^65, comfortably past it
+}};
+
+[[nodiscard]] X87Raw random_x87_value(std::mt19937_64& rng) {
+  if (rand_int(rng, 0, 99) < 15) {
+    std::uniform_int_distribution<std::uint64_t> full(0, UINT64_MAX);
+    return X87Raw{static_cast<std::uint16_t>(rand_int(rng, 0, 0xFFFF)), full(rng)};
+  }
+  X87Raw v = kX87Pool[static_cast<std::size_t>(rand_int(rng, 0, static_cast<int>(kX87Pool.size()) - 1))];
+  if (rand_int(rng, 0, 3) == 0) v.signexp ^= 0x8000u;  // same magnitude, other sign
+  return v;
+}
+
+constexpr std::array<std::uint32_t, 14> kF32Pool = {
+    0x00000000u, 0x80000000u, 0x3F800000u, 0xBF800000u, 0x00800000u, 0x007FFFFFu, 0x00000001u,
+    0x7F7FFFFFu, 0x7F800000u, 0xFF800000u, 0x7FC00000u, 0x7FA00000u, 0x40490FDBu, 0x5F000000u,
+};
+constexpr std::array<std::uint64_t, 14> kF64Pool = {
+    0x0000000000000000ull, 0x8000000000000000ull, 0x3FF0000000000000ull, 0xBFF0000000000000ull,
+    0x0010000000000000ull, 0x000FFFFFFFFFFFFFull, 0x0000000000000001ull, 0x7FEFFFFFFFFFFFFFull,
+    0x7FF0000000000000ull, 0xFFF0000000000000ull, 0x7FF8000000000000ull, 0x7FF4000000000000ull,
+    0x400921FB54442D18ull, 0x43E0000000000000ull,
+};
+constexpr std::array<std::uint64_t, 12> kX87IntPool = {
+    0ull, 1ull, 2ull, 100ull, 0x7FFFull, 0x8000ull, 0xFFFFull, 0x7FFFFFFFull,
+    0x80000000ull, 0x7FFFFFFFFFFFFFFFull, 0x8000000000000000ull, 0xFFFFFFFFFFFFFFFFull,
+};
+
+void plant_bytes(Ctx& c, std::int8_t disp, const std::uint8_t* src, std::size_t size) {
+  Ctx::ForcedBytes fb{};
+  fb.offset = static_cast<std::size_t>(disp);
+  fb.size = size;
+  for (std::size_t i = 0; i < size && i < fb.value.size(); ++i) fb.value[i] = src[i];
+  c.force_data_bytes = fb;
+}
+
+void plant_int(Ctx& c, std::int8_t disp, std::uint64_t value, std::size_t size) {
+  std::array<std::uint8_t, 10> bytes{};
+  for (std::size_t i = 0; i < size; ++i) bytes[i] = static_cast<std::uint8_t>(value >> (8 * i));
+  plant_bytes(c, disp, bytes.data(), size);
+}
+
+// A quarter of the time nothing is planted and the operand keeps the random scratch bytes, which is
+// its own kind of coverage: for m80 in particular that is how the unnormal and pseudo-NaN encodings
+// come up as memory sources rather than only as register contents.
+void plant_fp_operand(Ctx& c, std::int8_t disp, int size) {
+  if (rand_int(c.rng, 0, 3) == 0) return;
+  if (size == 4) {
+    plant_int(c, disp, kF32Pool[static_cast<std::size_t>(rand_int(c.rng, 0, static_cast<int>(kF32Pool.size()) - 1))], 4);
+  } else if (size == 8) {
+    plant_int(c, disp, kF64Pool[static_cast<std::size_t>(rand_int(c.rng, 0, static_cast<int>(kF64Pool.size()) - 1))], 8);
+  } else {
+    const X87Raw v = random_x87_value(c.rng);
+    std::array<std::uint8_t, 10> bytes{};
+    for (int i = 0; i < 8; ++i) bytes[static_cast<std::size_t>(i)] = static_cast<std::uint8_t>(v.signif >> (8 * i));
+    bytes[8] = static_cast<std::uint8_t>(v.signexp);
+    bytes[9] = static_cast<std::uint8_t>(v.signexp >> 8);
+    plant_bytes(c, disp, bytes.data(), 10);
+  }
+}
+
+void plant_int_operand(Ctx& c, std::int8_t disp, int size) {
+  if (rand_int(c.rng, 0, 3) == 0) return;
+  plant_int(c, disp, kX87IntPool[static_cast<std::size_t>(rand_int(c.rng, 0, static_cast<int>(kX87IntPool.size()) - 1))],
+            static_cast<std::size_t>(size));
+}
+
+// Every x87 family funnels through this so nothing forgets to ask next() for a populated stack.
+void x87_setup(Ctx& c, int needs) {
+  c.uses_x87 = true;
+  if (needs > c.x87_needs) c.x87_needs = needs;
+}
+
+struct X87MemForm {
+  Code code;
+  int size;
+};
+
+constexpr std::array<X87MemForm, 6> kX87Load = {{
+    {Code::FLD_M32FP, 4}, {Code::FLD_M64FP, 8}, {Code::FLD_M80FP, 10},
+    {Code::FILD_M16INT, 2}, {Code::FILD_M32INT, 4}, {Code::FILD_M64INT, 8},
+}};
+
+[[nodiscard]] std::optional<Instruction> gen_x87_load(Ctx& c) {
+  x87_setup(c, 0);
+  c.touches_memory = true;
+  const X87MemForm f = kX87Load[static_cast<std::size_t>(rand_int(c.rng, 0, static_cast<int>(kX87Load.size()) - 1))];
+  const std::int8_t disp = random_disp8(c.rng);
+  if (f.code == Code::FILD_M16INT || f.code == Code::FILD_M32INT || f.code == Code::FILD_M64INT) {
+    plant_int_operand(c, disp, f.size);
+  } else {
+    plant_fp_operand(c, disp, f.size);
+  }
+  return InstructionFactory::with1(f.code, mem_operand(disp));
+}
+
+constexpr std::array<X87MemForm, 11> kX87Store = {{
+    {Code::FST_M32FP, 4}, {Code::FST_M64FP, 8},
+    {Code::FSTP_M32FP, 4}, {Code::FSTP_M64FP, 8}, {Code::FSTP_M80FP, 10},
+    {Code::FIST_M16INT, 2}, {Code::FIST_M32INT, 4},
+    {Code::FISTP_M16INT, 2}, {Code::FISTP_M32INT, 4}, {Code::FISTP_M64INT, 8},
+    {Code::FISTTP_M32INT, 4},
+}};
+
+[[nodiscard]] std::optional<Instruction> gen_x87_store(Ctx& c) {
+  x87_setup(c, 1);
+  c.touches_memory = true;
+  const X87MemForm f = kX87Store[static_cast<std::size_t>(rand_int(c.rng, 0, static_cast<int>(kX87Store.size()) - 1))];
+  return InstructionFactory::with1(f.code, mem_operand(random_disp8(c.rng)));
+}
+
+// The pop forms name ST(i) as the destination and ST(0) as the source, the non-pop ST-ST forms come
+// in both directions, and the memory forms always target ST(0).
+struct X87ArithGroup {
+  Code st0_sti;
+  Code sti_st0;
+  Code stip_st0;
+  Code m32;
+  Code m64;
+  Code m16int;
+  Code m32int;
+};
+
+constexpr std::array<X87ArithGroup, 6> kX87Arith = {{
+    {Code::FADD_ST0_STI, Code::FADD_STI_ST0, Code::FADDP_STI_ST0, Code::FADD_M32FP, Code::FADD_M64FP,
+     Code::FIADD_M16INT, Code::FIADD_M32INT},
+    {Code::FMUL_ST0_STI, Code::FMUL_STI_ST0, Code::FMULP_STI_ST0, Code::FMUL_M32FP, Code::FMUL_M64FP,
+     Code::FIMUL_M16INT, Code::FIMUL_M32INT},
+    {Code::FSUB_ST0_STI, Code::FSUB_STI_ST0, Code::FSUBP_STI_ST0, Code::FSUB_M32FP, Code::FSUB_M64FP,
+     Code::FISUB_M16INT, Code::FISUB_M32INT},
+    {Code::FSUBR_ST0_STI, Code::FSUBR_STI_ST0, Code::FSUBRP_STI_ST0, Code::FSUBR_M32FP, Code::FSUBR_M64FP,
+     Code::FISUBR_M16INT, Code::FISUBR_M32INT},
+    {Code::FDIV_ST0_STI, Code::FDIV_STI_ST0, Code::FDIVP_STI_ST0, Code::FDIV_M32FP, Code::FDIV_M64FP,
+     Code::FIDIV_M16INT, Code::FIDIV_M32INT},
+    {Code::FDIVR_ST0_STI, Code::FDIVR_STI_ST0, Code::FDIVRP_STI_ST0, Code::FDIVR_M32FP, Code::FDIVR_M64FP,
+     Code::FIDIVR_M16INT, Code::FIDIVR_M32INT},
+}};
+
+[[nodiscard]] std::optional<Instruction> gen_x87_arith(Ctx& c) {
+  const X87ArithGroup& g = kX87Arith[static_cast<std::size_t>(rand_int(c.rng, 0, static_cast<int>(kX87Arith.size()) - 1))];
+  const int form = rand_int(c.rng, 0, 6);
+  if (form <= 2) {
+    const int i = rand_int(c.rng, 0, 7);
+    x87_setup(c, i + 1);
+    if (form == 0) return InstructionFactory::with2(g.st0_sti, Register::ST0, st_of(i));
+    if (form == 1) return InstructionFactory::with2(g.sti_st0, st_of(i), Register::ST0);
+    return InstructionFactory::with2(g.stip_st0, st_of(i), Register::ST0);
+  }
+  x87_setup(c, 1);
+  c.touches_memory = true;
+  const std::int8_t disp = random_disp8(c.rng);
+  switch (form) {
+    case 3: plant_fp_operand(c, disp, 4); return InstructionFactory::with1(g.m32, mem_operand(disp));
+    case 4: plant_fp_operand(c, disp, 8); return InstructionFactory::with1(g.m64, mem_operand(disp));
+    case 5: plant_int_operand(c, disp, 2); return InstructionFactory::with1(g.m16int, mem_operand(disp));
+    default: plant_int_operand(c, disp, 4); return InstructionFactory::with1(g.m32int, mem_operand(disp));
+  }
+}
+
+// Exactly-specified unary operations only. The transcendentals get their own family below because
+// bit-exactness against Intel's microcode is a different question from correctness.
+constexpr std::array<Code, 4> kX87Unary1 = {Code::FSQRT, Code::FRNDINT, Code::FABS, Code::FCHS};
+constexpr std::array<Code, 4> kX87Unary2 = {Code::FSCALE, Code::FPREM, Code::FPREM1, Code::FXTRACT};
+
+[[nodiscard]] std::optional<Instruction> gen_x87_unary(Ctx& c) {
+  // FXTRACT reads one register but pushes a second result, so it wants a slot free as well.
+  if (rand_int(c.rng, 0, 1) == 0) {
+    x87_setup(c, 1);
+    return InstructionFactory::with(kX87Unary1[static_cast<std::size_t>(rand_int(c.rng, 0, 3))]);
+  }
+  const Code code = kX87Unary2[static_cast<std::size_t>(rand_int(c.rng, 0, 3))];
+  x87_setup(c, code == Code::FXTRACT ? 1 : 2);
+  return InstructionFactory::with(code);
+}
+
+constexpr std::array<Code, 8> kX87Transcendental = {
+    Code::FSIN, Code::FCOS, Code::FSINCOS, Code::FPTAN,
+    Code::F2XM1, Code::FYL2X, Code::FYL2XP1, Code::FPATAN,
+};
+
+[[nodiscard]] std::optional<Instruction> gen_x87_transcendental(Ctx& c) {
+  const Code code = kX87Transcendental[static_cast<std::size_t>(rand_int(c.rng, 0, 7))];
+  const bool two_operand = code == Code::FYL2X || code == Code::FYL2XP1 || code == Code::FPATAN;
+  x87_setup(c, two_operand ? 2 : 1);
+  return InstructionFactory::with(code);
+}
+
+[[nodiscard]] std::optional<Instruction> gen_x87_compare(Ctx& c) {
+  const int form = rand_int(c.rng, 0, 9);
+  if (form == 0) {
+    x87_setup(c, 1);
+    return InstructionFactory::with(Code::FTST);
+  }
+  if (form == 1) {
+    x87_setup(c, 1);
+    return InstructionFactory::with(Code::FXAM);
+  }
+  if (form == 2) {
+    x87_setup(c, 2);
+    return InstructionFactory::with(rand_int(c.rng, 0, 1) == 0 ? Code::FCOMPP : Code::FUCOMPP);
+  }
+  if (form <= 4) {
+    x87_setup(c, 1);
+    c.touches_memory = true;
+    const bool m64 = rand_int(c.rng, 0, 1) == 0;
+    const bool pop = rand_int(c.rng, 0, 1) == 0;
+    const std::int8_t disp = random_disp8(c.rng);
+    plant_fp_operand(c, disp, m64 ? 8 : 4);
+    const Code code = m64 ? (pop ? Code::FCOMP_M64FP : Code::FCOM_M64FP)
+                          : (pop ? Code::FCOMP_M32FP : Code::FCOM_M32FP);
+    return InstructionFactory::with1(code, mem_operand(disp));
+  }
+  // The DCD0/DCD8/DED0 entries are the undocumented alias encodings of the same three operations;
+  // hardware runs them, so they are worth putting through the decoder as well.
+  static constexpr std::array<Code, 11> kStSt = {
+      Code::FCOM_ST0_STI,   Code::FCOMP_ST0_STI,  Code::FUCOM_ST0_STI,  Code::FUCOMP_ST0_STI,
+      Code::FCOMI_ST0_STI,  Code::FCOMIP_ST0_STI, Code::FUCOMI_ST0_STI, Code::FUCOMIP_ST0_STI,
+      Code::FCOM_ST0_STI_DCD0, Code::FCOMP_ST0_STI_DCD8, Code::FCOMP_ST0_STI_DED0,
+  };
+  const int i = rand_int(c.rng, 0, 7);
+  x87_setup(c, i + 1);
+  return InstructionFactory::with2(kStSt[static_cast<std::size_t>(rand_int(c.rng, 0, 10))], Register::ST0, st_of(i));
+}
+
+[[nodiscard]] std::optional<Instruction> gen_x87_move(Ctx& c) {
+  const int form = rand_int(c.rng, 0, 5);
+  const int i = rand_int(c.rng, 0, 7);
+  switch (form) {
+    case 0:
+      x87_setup(c, i + 1);
+      return InstructionFactory::with1(Code::FLD_STI, st_of(i));
+    case 1: {
+      static constexpr std::array<Code, 5> kStore = {Code::FST_STI, Code::FSTP_STI, Code::FSTP_STI_DFD0,
+                                                      Code::FSTP_STI_DFD8, Code::FSTPNCE_STI};
+      x87_setup(c, 1);
+      return InstructionFactory::with1(kStore[static_cast<std::size_t>(rand_int(c.rng, 0, 4))], st_of(i));
+    }
+    case 2: {
+      static constexpr std::array<Code, 3> kXchg = {Code::FXCH_ST0_STI, Code::FXCH_ST0_STI_DDC8,
+                                                     Code::FXCH_ST0_STI_DFC8};
+      x87_setup(c, i + 1);
+      return InstructionFactory::with2(kXchg[static_cast<std::size_t>(rand_int(c.rng, 0, 2))], Register::ST0, st_of(i));
+    }
+    case 3:
+      x87_setup(c, 0);
+      return InstructionFactory::with1(rand_int(c.rng, 0, 1) == 0 ? Code::FFREE_STI : Code::FFREEP_STI, st_of(i));
+    case 4: {
+      static constexpr std::array<Code, 8> kConst = {Code::FLD1, Code::FLDZ,   Code::FLDPI,  Code::FLDL2T,
+                                                      Code::FLDL2E, Code::FLDLG2, Code::FLDLN2, Code::FNOP};
+      x87_setup(c, 0);
+      return InstructionFactory::with(kConst[static_cast<std::size_t>(rand_int(c.rng, 0, 7))]);
+    }
+    default: {
+      static constexpr std::array<Code, 8> kCmov = {
+          Code::FCMOVB_ST0_STI,  Code::FCMOVE_ST0_STI,  Code::FCMOVBE_ST0_STI, Code::FCMOVU_ST0_STI,
+          Code::FCMOVNB_ST0_STI, Code::FCMOVNE_ST0_STI, Code::FCMOVNBE_ST0_STI, Code::FCMOVNU_ST0_STI};
+      x87_setup(c, i + 1);
+      return InstructionFactory::with2(kCmov[static_cast<std::size_t>(rand_int(c.rng, 0, 7))], Register::ST0, st_of(i));
+    }
+  }
+}
+
+[[nodiscard]] std::optional<Instruction> gen_x87_control(Ctx& c) {
+  const int form = rand_int(c.rng, 0, 6);
+  x87_setup(c, 0);
+  switch (form) {
+    case 0:
+      return InstructionFactory::with(Code::FNSTSW_AX);
+    case 1:
+      c.touches_memory = true;
+      return InstructionFactory::with1(Code::FNSTSW_M2BYTE, mem_operand(random_disp8(c.rng)));
+    case 2:
+      c.touches_memory = true;
+      return InstructionFactory::with1(Code::FNSTCW_M2BYTE, mem_operand(random_disp8(c.rng)));
+    case 3: {
+      // The loaded word is planted rather than left random for the same reason FLDENV is out
+      // entirely: a random 16 bits unmasks exceptions, and an unmasked x87 exception in this
+      // harness surfaces inside some later test case instead of this one. Bit 12 (infinity
+      // control) is architecturally ignored but still stored, so it rides along to check that both
+      // engines keep it rather than normalizing it away.
+      c.touches_memory = true;
+      const std::int8_t disp = random_disp8(c.rng);
+      const auto cw = static_cast<std::uint16_t>(0x037Fu | (static_cast<unsigned>(rand_int(c.rng, 0, 3)) << 10) |
+                                                  (rand_int(c.rng, 0, 3) == 0 ? 0x1000u : 0u));
+      plant_int(c, disp, cw, 2);
+      return InstructionFactory::with1(Code::FLDCW_M2BYTE, mem_operand(disp));
+    }
+    case 4:
+      return InstructionFactory::with(Code::FNCLEX);
+    case 5:
+      return InstructionFactory::with(Code::FNINIT);
+    default:
+      return InstructionFactory::with(rand_int(c.rng, 0, 1) == 0 ? Code::FINCSTP : Code::FDECSTP);
+  }
+}
+
 // -------------------------------------------------------------- dispatch
 
 using GenFn = std::optional<Instruction> (*)(Ctx&);
-constexpr std::array<GenFn, 38> kFamilies = {
+constexpr std::array<GenFn, 46> kFamilies = {
     gen_alu, gen_test, gen_unary, gen_shift, gen_mov, gen_movx, gen_movsxd,
     gen_pushpop, gen_lea, gen_jcc, gen_jmp, gen_call, gen_ret, gen_setcc,
     gen_cmovcc, gen_bt, gen_rmsrc, gen_bswap,
@@ -1601,6 +1982,9 @@ constexpr std::array<GenFn, 38> kFamilies = {
     gen_simd_shuffle, gen_simd_logic, gen_simd_pack, gen_simd_shift, gen_simd_fp,
     gen_sse_arith, gen_packed_int, gen_sse_move,
     gen_privileged, gen_privileged_movcrdr,
+    gen_x87_load, gen_x87_store, gen_x87_arith, gen_x87_unary, gen_x87_compare, gen_x87_move,
+    gen_x87_control,
+    gen_x87_transcendental,
 };
 
 [[nodiscard]] std::string hex_dump(const std::vector<std::uint8_t>& b) {
@@ -1650,6 +2034,47 @@ TestCase InstructionGenerator::next() {
         tc.initial.xmm_hi[static_cast<std::size_t>(i)] = random_interesting_u64(rng_);
       }
 
+      if (c.uses_x87) {
+        X87State& x = tc.initial.x87;
+        // Exception masks stay set and PC stays at extended; only RC moves. See the x87 section's
+        // header comment for both reasons.
+        x.control_word = static_cast<std::uint16_t>(0x037Fu | (static_cast<unsigned>(rand_int(rng_, 0, 3)) << 10));
+        const int top = rand_int(rng_, 0, 7);
+        // The stack normally holds at least what the instruction reads, so most cases exercise the
+        // operation itself. The rest deliberately come up short: a masked stack underflow has its
+        // own fully defined behaviour (indefinite QNaN, C1 cleared, SF set) that is just as much
+        // part of the spec as the arithmetic is.
+        const int depth = rand_int(rng_, 0, 99) < 10
+                              ? rand_int(rng_, 0, 8)
+                              : c.x87_needs + rand_int(rng_, 0, 8 - c.x87_needs);
+        auto sw = static_cast<std::uint16_t>(static_cast<unsigned>(top) << 11);
+        if (rand_int(rng_, 0, 3) == 0) {
+          // Stale condition codes and sticky exception flags, so "does this clear what it does not
+          // define" gets exercised alongside "does it set what it does". ES and B are left alone:
+          // they describe an exception this corpus deliberately never lets happen.
+          static constexpr std::uint16_t kStaleBits[] = {0x0001, 0x0002, 0x0004, 0x0008, 0x0010,
+                                                          0x0020, 0x0040, 0x0100, 0x0200, 0x0400, 0x4000};
+          for (const auto bit : kStaleBits) {
+            if (rand_int(rng_, 0, 5) == 0) sw |= bit;
+          }
+        }
+        x.status_word = sw;
+        std::uint16_t tw = 0xFFFF;  // every slot empty, then punch in the live ones
+        for (int i = 0; i < depth; ++i) {
+          const X87Raw v = random_x87_value(rng_);
+          x.signexp[static_cast<std::size_t>(i)] = v.signexp;
+          x.signif[static_cast<std::size_t>(i)] = v.signif;
+          // The tag word is indexed by physical register while the values above are ST-relative,
+          // and the tag itself has to be the one hardware would derive from the value, since that
+          // is exactly what FXRSTOR does with the abridged byte the hardware lane hands it.
+          const int phys = (top + i) & 0x7;
+          tw = static_cast<std::uint16_t>(tw & ~(0x3u << (2 * phys)));
+          tw = static_cast<std::uint16_t>(tw | (static_cast<unsigned>(x87_classify_tag(v.signexp, v.signif))
+                                                << (2 * phys)));
+        }
+        x.tag_word = tw;
+      }
+
       std::uint64_t fl = 0x2;  // reserved bit 1
       static constexpr std::uint64_t kRandFlags[] = {0x1, 0x4, 0x10, 0x40, 0x80, 0x400, 0x800};
       for (const auto bitv : kRandFlags) {
@@ -1664,6 +2089,13 @@ TestCase InstructionGenerator::next() {
         for (std::size_t b = 0; b < 8; ++b) {
           tc.data_seed[c.force_data_qword->offset + b] =
               static_cast<std::uint8_t>(c.force_data_qword->value >> (8 * b));
+        }
+      }
+
+      if (c.force_data_bytes.has_value() &&
+          c.force_data_bytes->offset + c.force_data_bytes->size <= tc.data_seed.size()) {
+        for (std::size_t b = 0; b < c.force_data_bytes->size; ++b) {
+          tc.data_seed[c.force_data_bytes->offset + b] = c.force_data_bytes->value[b];
         }
       }
 
