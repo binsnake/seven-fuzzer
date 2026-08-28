@@ -602,6 +602,15 @@ int run_seed_sweep(std::uint64_t base_seed, std::uint64_t iterations_per_seed, u
     cmdline += L" --watchdog-seconds " + std::to_wstring(watchdog_seconds);
     if (threads_explicit) cmdline += L" --threads " + std::to_wstring(threads);
 
+    // Clear the dumps before the child rather than only after it. The archiving below moves
+    // whatever is sitting in the exe directory into this seed's results, so a dump left over from
+    // an earlier unrelated run gets filed under the first seed of the next sweep, which then reads
+    // as a crash on a seed that finished clean.
+    for (const wchar_t* stale : {L"crash.dmp", L"watchdog_hang.dmp"}) {
+      std::error_code ec;
+      fs::remove(exe_dir_path / stale, ec);
+    }
+
     STARTUPINFOW si{};
     si.cb = sizeof(si);
     PROCESS_INFORMATION pi{};
