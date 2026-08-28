@@ -979,6 +979,68 @@ const std::array<const RmSrcCodes*, 5> kRmSrcFamily = {&kBsf, &kBsr, &kPopcnt, &
   return InstructionFactory::with1(w64 ? Code::BSWAP_R64 : Code::BSWAP_R32, reg_of(w64 ? Width::W64 : Width::W32, r));
 }
 
+// ------------------------------------------------------------------- BMI1/BMI2
+// The only VEX-encoded family in this generator. Everything in the SIMD sections above is legacy
+// SSE, so no VEX prefix had ever been produced at all and not one of these twenty-six codes had
+// ever been generated -- seven's implementations of them had only ever been checked by reading.
+//
+// AF and PF are architecturally undefined for every BMI1 code, so they come out of the comparison
+// mask. The BMI2 half writes no flags whatsoever, which the full mask already covers since both
+// engines then leave them alone.
+enum class BmiShape { kDstSrcRm, kDstRmSrc, kDstRm, kDstRmImm };
+
+struct BmiEntry {
+  std::array<Code, 2> code;  // 32, 64
+  BmiShape shape;
+  bool writes_flags;
+};
+
+const std::array<BmiEntry, 13> kBmi = {{
+    {{Code::VEX_ANDN_R32_R32_RM32, Code::VEX_ANDN_R64_R64_RM64}, BmiShape::kDstSrcRm, true},
+    {{Code::VEX_BEXTR_R32_RM32_R32, Code::VEX_BEXTR_R64_RM64_R64}, BmiShape::kDstRmSrc, true},
+    {{Code::VEX_BLSI_R32_RM32, Code::VEX_BLSI_R64_RM64}, BmiShape::kDstRm, true},
+    {{Code::VEX_BLSMSK_R32_RM32, Code::VEX_BLSMSK_R64_RM64}, BmiShape::kDstRm, true},
+    {{Code::VEX_BLSR_R32_RM32, Code::VEX_BLSR_R64_RM64}, BmiShape::kDstRm, true},
+    {{Code::VEX_BZHI_R32_RM32_R32, Code::VEX_BZHI_R64_RM64_R64}, BmiShape::kDstRmSrc, true},
+    {{Code::VEX_PDEP_R32_R32_RM32, Code::VEX_PDEP_R64_R64_RM64}, BmiShape::kDstSrcRm, false},
+    {{Code::VEX_PEXT_R32_R32_RM32, Code::VEX_PEXT_R64_R64_RM64}, BmiShape::kDstSrcRm, false},
+    {{Code::VEX_MULX_R32_R32_RM32, Code::VEX_MULX_R64_R64_RM64}, BmiShape::kDstSrcRm, false},
+    {{Code::VEX_RORX_R32_RM32_IMM8, Code::VEX_RORX_R64_RM64_IMM8}, BmiShape::kDstRmImm, false},
+    {{Code::VEX_SARX_R32_RM32_R32, Code::VEX_SARX_R64_RM64_R64}, BmiShape::kDstRmSrc, false},
+    {{Code::VEX_SHLX_R32_RM32_R32, Code::VEX_SHLX_R64_RM64_R64}, BmiShape::kDstRmSrc, false},
+    {{Code::VEX_SHRX_R32_RM32_R32, Code::VEX_SHRX_R64_RM64_R64}, BmiShape::kDstRmSrc, false},
+}};
+
+[[nodiscard]] std::optional<Instruction> gen_bmi(Ctx& c) {
+  const BmiEntry& e = kBmi[static_cast<std::size_t>(rand_int(c.rng, 0, static_cast<int>(kBmi.size()) - 1))];
+  const bool w64 = rand_int(c.rng, 0, 1) == 0;
+  const Width w = w64 ? Width::W64 : Width::W32;
+  const Code code = e.code[w64 ? 1 : 0];
+  if (e.writes_flags) {
+    c.flags_mask = 0x001ull | 0x040ull | 0x080ull | 0x800ull;  // CF, ZF, SF, OF
+  }
+  const int d = pick_reg_index(c.rng);
+  const int s = pick_reg_index(c.rng);
+  const bool rm_is_mem = rand_int(c.rng, 0, 2) == 0;
+  if (rm_is_mem) c.touches_memory = true;
+  const std::int8_t disp = random_disp8(c.rng);
+  const auto imm8 = static_cast<std::int32_t>(random_imm(c.rng, 8));
+  switch (e.shape) {
+    case BmiShape::kDstSrcRm:
+      return rm_is_mem ? InstructionFactory::with3(code, reg_of(w, d), reg_of(w, s), mem_operand(disp))
+                       : InstructionFactory::with3(code, reg_of(w, d), reg_of(w, s), reg_of(w, pick_reg_index(c.rng)));
+    case BmiShape::kDstRmSrc:
+      return rm_is_mem ? InstructionFactory::with3(code, reg_of(w, d), mem_operand(disp), reg_of(w, s))
+                       : InstructionFactory::with3(code, reg_of(w, d), reg_of(w, pick_reg_index(c.rng)), reg_of(w, s));
+    case BmiShape::kDstRm:
+      return rm_is_mem ? InstructionFactory::with2(code, reg_of(w, d), mem_operand(disp))
+                       : InstructionFactory::with2(code, reg_of(w, d), reg_of(w, s));
+    default:
+      return rm_is_mem ? InstructionFactory::with3(code, reg_of(w, d), mem_operand(disp), imm8)
+                       : InstructionFactory::with3(code, reg_of(w, d), reg_of(w, s), imm8);
+  }
+}
+
 // ---------------------------------------------------------- MUL/IMUL/DIV/IDIV
 
 struct W4Codes {
@@ -1532,12 +1594,13 @@ constexpr std::array<SseMoveForm, 15> kSseMoveStore = {{
 // -------------------------------------------------------------- dispatch
 
 using GenFn = std::optional<Instruction> (*)(Ctx&);
-constexpr std::array<GenFn, 35> kFamilies = {
+constexpr std::array<GenFn, 36> kFamilies = {
     gen_alu, gen_test, gen_unary, gen_shift, gen_mov, gen_movx, gen_movsxd,
     gen_pushpop, gen_lea, gen_jcc, gen_jmp, gen_call, gen_ret, gen_setcc,
     gen_cmovcc, gen_bt, gen_rmsrc, gen_bswap,
     gen_loop, gen_xchg, gen_xadd_cmpxchg, gen_shld_shrd, gen_movbe_crc32_nop, gen_moffs,
     gen_string_ops,
+    gen_bmi,
     gen_muldiv, gen_imul_multi,
     gen_simd_shuffle, gen_simd_logic, gen_simd_pack, gen_simd_shift, gen_simd_fp,
     gen_sse_arith, gen_packed_int, gen_sse_move,
