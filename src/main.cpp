@@ -779,13 +779,14 @@ int main(int argc, char** argv) {
   // worker stops making progress, so a hang here is now bounded and postmortem-debuggable without
   // needing to catch it live under cdb. Still worth wrapping in an external wall-clock timeout too
   // (e.g. `timeout` on Linux, a job object or scheduled-task deadline on Windows) as a second layer.
-  if (use_jit && threads > 1) {
-    std::printf(
-        "seven-fuzzer: --jit is not yet safe multi-threaded (missing SEH unwind info for JIT "
-        "code) -- clamping threads %u -> 1\n",
-        threads);
-    threads = 1;
-  }
+  // The clamp that used to sit here is gone: seven-jit registers real unwind info for its compiled
+  // code now (jit_unwind.hpp, kRegistrationEnabled), which is exactly the condition the comment
+  // above said to remove it on. Measured rather than assumed before deleting it -- 8 workers,
+  // 20 seeds x 30000 iterations with the hardware oracle on, clean=20 crashed=0 watchdog_killed=0,
+  // against a claim that the unclamped path crashed within a couple dozen iterations per worker.
+  //
+  // The Unicorn TCG allocator hazard described above is NOT fixed and is not what the clamp was
+  // for; it affects single-threaded runs too and lives in vendored Unicorn, not in seven-jit.
 
   std::printf("seven-fuzzer: iterations=%llu seed=0x%llX hw=%s engine=%s threads=%u\n",
               static_cast<unsigned long long>(iterations), static_cast<unsigned long long>(seed),
