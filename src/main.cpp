@@ -258,6 +258,14 @@ void seh_translator(unsigned int code, EXCEPTION_POINTERS* ep) {
   throw SehException{code, addr};
 }
 
+// How many dump files each of findings/ and unicorn_outliers/ may hold before the rest are counted
+// but not written. A run against a genuinely broken area produces divergences by the thousand -- the
+// x87 families alone found ~2,300 in 30k iterations -- and one text file each filled a 954GB disk to
+// zero, which takes the whole machine down, not just the run. The counts printed at the end stay
+// exact either way, and a few hundred dumps is already far more than anyone reads before fixing the
+// first one and re-running.
+constexpr int kMaxDumpFilesPerDir = 250;
+
 struct SharedCounters {
   std::atomic<int> finding_count{0};
   std::atomic<int> unicorn_outlier_saved{0};  // index counter for the saved-outlier files, separate from the count below
@@ -438,9 +446,11 @@ void run_worker(int worker_id, std::uint64_t iterations, std::uint64_t seed, boo
       std::vector<Divergence> outlier_divergences = seven_vs_unicorn;
       outlier_divergences.insert(outlier_divergences.end(), unicorn_vs_hw.begin(), unicorn_vs_hw.end());
       const int oidx = counters.unicorn_outlier_saved.fetch_add(1, std::memory_order_relaxed);
-      std::lock_guard<std::mutex> lock(counters.io_mutex);
-      (void)write_finding(outliers_dir, oidx, tc, seven_label, seven_out, unicorn_out, hw_out, hw_ok_this_round,
-                           outlier_divergences);
+      if (oidx < kMaxDumpFilesPerDir) {
+        std::lock_guard<std::mutex> lock(counters.io_mutex);
+        (void)write_finding(outliers_dir, oidx, tc, seven_label, seven_out, unicorn_out, hw_out, hw_ok_this_round,
+                             outlier_divergences);
+      }
     } else {
       std::vector<Divergence> divergences = seven_vs_unicorn;
       divergences.insert(divergences.end(), seven_vs_hw.begin(), seven_vs_hw.end());
@@ -453,9 +463,14 @@ void run_worker(int worker_id, std::uint64_t iterations, std::uint64_t seed, boo
         // isn't guaranteed by the standard even if a given implementation
         // usually gets away with it.
         std::lock_guard<std::mutex> lock(counters.io_mutex);
-        const std::string path = write_finding(findings_dir, idx, tc, seven_label, seven_out, unicorn_out, hw_out,
-                                                hw_ok_this_round, divergences);
-        std::printf("[worker %d] DIVERGENCE (%s) -> %s\n", worker_id, tc.text.c_str(), path.c_str());
+        if (idx < kMaxDumpFilesPerDir) {
+          const std::string path = write_finding(findings_dir, idx, tc, seven_label, seven_out, unicorn_out, hw_out,
+                                                  hw_ok_this_round, divergences);
+          std::printf("[worker %d] DIVERGENCE (%s) -> %s\n", worker_id, tc.text.c_str(), path.c_str());
+        } else if (idx == kMaxDumpFilesPerDir) {
+          std::printf("[worker %d] %d dumps written, still counting but no longer writing them\n", worker_id,
+                      kMaxDumpFilesPerDir);
+        }
         std::fflush(stdout);
       }
     }
